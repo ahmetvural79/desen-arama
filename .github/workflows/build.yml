@@ -12,6 +12,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write   # etiket push'unda GitHub Release oluşturmak için gerekli
+
 jobs:
   test:
     runs-on: ubuntu-latest
