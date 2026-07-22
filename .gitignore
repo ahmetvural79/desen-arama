@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Uygulama verisi / çıktılar
+test_dataset/
+bench.md
+*.db
+*.db-wal
+*.db-shm
+*.faiss
+*.onnx
+logs/
+
+# İşletim sistemi
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
