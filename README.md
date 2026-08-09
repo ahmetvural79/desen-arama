@@ -84,6 +84,38 @@ edildi:
 
 ---
 
+## Kurulum (kullanıcı)
+
+[Releases](https://github.com/ahmetvural79/desen-arama/releases) sayfasından
+iki dosyadan biri indirilir:
+
+- `DesenAramaSetup-1.1.0.exe` — kurulum sihirbazı
+- `DesenArama-portable-win64.zip` — kurulum gerektirmez, açıp `DesenArama.exe`
+
+> Windows SmartScreen "bilinmeyen yayımcı" uyarısı verebilir (paket henüz kod
+> imzalı değildir): **Daha fazla bilgi → Yine de çalıştır**.
+
+### İlk çalıştırma
+
+1. **Kütüphane Ekle** ile desen klasörünü seçin (ağ/UNC yolu da olur).
+2. **İndeksle / Güncelle**. Varsayılan "Hızlı (hash)" modu model gerektirmez.
+3. Sorgu görselini sürükleyip bırakın veya **Sorgu Seç**'e tıklayın.
+
+### Daha iyi sonuç için
+
+- Arama yöntemini **"Hibrit — önerilen"** yapın. İlk seçişte ~88 MB'lık DINOv2
+  modelini indirmeyi önerir; ölçümlerde hibrit her senaryoda saf AI'yı geçti.
+- Sorgularınız çoğunlukla desenin bir **parçasıysa** (motif fotoğrafı, kısmi
+  tarama), Ayarlar → *Kısmi eşleşme* bölümünden karo indekslemeyi açın.
+  İndeksleme ~10× yavaşlar; kırpılmış sorgular ancak bu şekilde bulunur.
+- Aynı deseni **aynı renkte** öne almak istiyorsanız "Renk önemi" kaydırıcısını
+  yükseltin. Varsayılan 0'dır: farklı renkli (colorway) varyantlar gömülmesin
+  diye.
+- İnternet erişimi yoksa model dosyasını elle
+  `%LOCALAPPDATA%\DesenArama\models\dinov2_vits14.onnx` konumuna kopyalayın.
+
+---
+
 ## Kurulum (geliştirici)
 
 ```bash
