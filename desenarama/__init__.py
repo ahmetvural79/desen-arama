@@ -7,7 +7,7 @@ Windows üzerinde, yerel veya ağ (SMB/UNC) klasörlerinde çalışacak
 vektörler) daima yerel disktedir.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __app_name__ = "Desen Arama"
 __app_id__ = "DesenArama"  # %LOCALAPPDATA%\DesenArama
 
