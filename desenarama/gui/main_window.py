@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
+from PySide6.QtCore import Qt, QEventLoop, QSize, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
@@ -308,9 +308,11 @@ class MainWindow(QMainWindow):
 
         thread, _ = run_in_thread(worker)
         self._threads.append((thread, worker))
-        # İndirme bitene kadar olay döngüsünü çevir; pencere yanıt vermeye devam eder.
+        # İndirme bitene kadar olay döngüsünü çevir; pencere yanıt vermeye devam
+        # eder. WaitForMoreEvents olmadan bu döngü boşta dönerek bir çekirdeği
+        # doldurur — 88 MB'lık bir indirme boyunca fark edilir.
         while not outcome:
-            QApplication.processEvents()
+            QApplication.processEvents(QEventLoop.AllEvents | QEventLoop.WaitForMoreEvents, 50)
         dialog.close()
 
         if outcome.get("ok"):
