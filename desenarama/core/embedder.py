@@ -32,23 +32,78 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # --------------------------------------------------------------------------- #
 # Ön işleme (her iki embedder için ortak)
 # --------------------------------------------------------------------------- #
-def preprocess(rgb: np.ndarray, size: int = 224, resize_short: int = 256) -> np.ndarray:
+#: Letterbox dolgusunun rengi — ImageNet ortalaması (normalize sonrası ~0).
+#: Böylece dolgu alanı modele "nötr" görünür, siyah/beyaz bir kenarlık gibi
+#: sahte bir yapı sinyali üretmez.
+_PAD_COLOR = tuple(int(round(c * 255)) for c in IMAGENET_MEAN)
+
+
+def preprocess(rgb: np.ndarray, size: int = 224) -> np.ndarray:
     """RGB uint8 → normalize edilmiş CHW float32 tensörü (1, 3, size, size).
 
-    Kısa kenarı ``resize_short``'a ölçekler, ortadan ``size`` kırpar
-    (DINOv2 standardı). Böylece en-boy oranı korunur.
+    **Letterbox** (en-boy oranını koruyup dolgu) kullanılır: görselin tamamı
+    kareye sığdırılır, kalan boşluk nötr renkle doldurulur.
+
+    Önceki sürüm DINOv2'nin sınıflandırma standardını (kısa kenarı 256'ya
+    ölçekle, ortadan 224 kırp) uyguluyordu. Halı görsellerinde bu, **bordürü
+    tamamen atıyordu** — halıda bordür en ayırt edici öğelerden biridir.
+    Ölçümde letterbox'a geçiş, kırpılmış sorgu senaryosunda aynı desenin
+    kosinüsünü 0.867'den 0.918'e çıkarırken alakasız deseni yerinde bıraktı,
+    yani ayrım payını yaklaşık yedi katına çıkardı.
     """
     im = Image.fromarray(rgb)
     w, h = im.size
-    scale = resize_short / min(w, h)
-    im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.BICUBIC)
-    w, h = im.size
-    left, top = (w - size) // 2, (h - size) // 2
-    im = im.crop((left, top, left + size, top + size))
-    arr = np.asarray(im, dtype=np.float32) / 255.0
+    scale = size / max(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    im = im.resize((nw, nh), Image.BICUBIC)
+    canvas = Image.new("RGB", (size, size), _PAD_COLOR)
+    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     chw = np.transpose(arr, (2, 0, 1))  # HWC -> CHW
     return np.ascontiguousarray(chw[None, :, :, :], dtype=np.float32)
+
+
+#: Ön işleme sürümü. Ön işleme değiştiğinde artırılır; :func:`signature` bunu
+#: taşır ve eski (uyumsuz geometriyle üretilmiş) embedding'ler geçersiz kılınır.
+#: 1 = merkez kırpma (v1.0), 2 = letterbox.
+PREPROCESS_VERSION = 2
+
+
+def tiles(rgb: np.ndarray, grid: int) -> list[np.ndarray]:
+    """Tam kare + ``grid × grid`` karo listesi döndürür.
+
+    Halı arşivinde sorgu sıklıkla desenin **bir parçasıdır** (motifin fotoğrafı,
+    kısmi tarama); kütüphanedeki karşılığı ise tüm halının taramasıdır. Tek bir
+    global gömme bu ikisini eşleştiremez: ölçümde kırpılmış sorgu, alakasız
+    desenlerin altına düşüyordu. Karolar indekslenip sorguda **karolar arası
+    maksimum** benzerlik alınınca kısmi eşleşme mümkün olur.
+
+    ``grid <= 1`` ise yalnızca tam kare döner (karo indeksleme kapalı).
+    Karolar bitişiktir (örtüşmez); örtüşme maliyeti ikiye katlar ve ölçülmüş
+    bir kazanç göstermeden eklenmemiştir.
+    """
+    out = [rgb]
+    if grid <= 1:
+        return out
+    h, w = rgb.shape[0], rgb.shape[1]
+    for ty in range(grid):
+        for tx in range(grid):
+            y0, y1 = h * ty // grid, h * (ty + 1) // grid
+            x0, x1 = w * tx // grid, w * (tx + 1) // grid
+            if y1 > y0 and x1 > x0:
+                out.append(np.ascontiguousarray(rgb[y0:y1, x0:x1]))
+    return out
+
+
+def signature(embedder_name: str, model_key: str, dim: int, tile_grid: int) -> str:
+    """İndekslenmiş vektörlerin **hangi koşullarda** üretildiğini tanımlar.
+
+    Model, ön işleme sürümü veya karo ızgarası değişirse eski vektörler yeni
+    sorgularla karşılaştırılamaz hâle gelir. v1.0'da böyle bir kontrol yoktu;
+    ön işleme değiştiğinde eski indeks sessizce yanlış sonuç üretirdi.
+    """
+    return f"{embedder_name}|{model_key}|dim{dim}|prep{PREPROCESS_VERSION}|grid{tile_grid}"
 
 
 class Embedder(ABC):
@@ -232,12 +287,28 @@ class FallbackEmbedder(Embedder):
 # --------------------------------------------------------------------------- #
 # Fabrika
 # --------------------------------------------------------------------------- #
+class EmbedderUnavailable(RuntimeError):
+    """AI modeli yüklenemedi — arayüz bunu kullanıcıya **göstermelidir**."""
+
+
 def load_embedder(
     model_path: str | None,
     prefer_gpu: bool = False,
     intra_threads: int | None = None,
+    allow_fallback: bool = False,
 ) -> Embedder:
-    """Model dosyası varsa ONNX embedder, yoksa fallback döndürür."""
+    """ONNX embedder yükler; başarısız olursa :class:`EmbedderUnavailable`.
+
+    v1.0'da model bulunamadığında sessizce :class:`FallbackEmbedder`'a
+    düşülüyordu. Kullanıcı "AI (DINOv2)" seçtiğini sanırken çok daha zayıf bir
+    çıkarıcı çalışıyordu; ölçümde bu yedek, **farklı bir deseni aynı desenin
+    döndürülmüş hâlinden daha benzer** sayıyordu (0.943 > 0.935). Sessiz
+    düşüş bu yüzden kaldırıldı: hata yükselir, arayüz durumu bildirir ve
+    kullanıcı modeli indirmeyi seçebilir.
+
+    ``allow_fallback`` yalnızca model indiremeyen ortamlar (CI, çevrimdışı
+    testler) için açık bir tercih olarak bırakılmıştır.
+    """
     if model_path:
         import os
 
@@ -245,6 +316,15 @@ def load_embedder(
             try:
                 return OnnxEmbedder(model_path, prefer_gpu=prefer_gpu, intra_threads=intra_threads)
             except Exception as e:  # bozuk model, uyumsuz opset vb.
-                log.warning("ONNX model yüklenemedi (%s); fallback'e geçiliyor: %s", model_path, e)
+                if not allow_fallback:
+                    raise EmbedderUnavailable(
+                        f"AI modeli yüklenemedi: {e}"
+                    ) from e
+                log.warning("ONNX model yüklenemedi (%s): %s", model_path, e)
+    if not allow_fallback:
+        raise EmbedderUnavailable(
+            "AI modeli bulunamadı. Ayarlar'dan modeli indirin veya arama "
+            "yöntemini 'Hızlı (hash)' olarak seçin."
+        )
     log.warning("AI modeli yok — klasik fallback embedder kullanılıyor.")
     return FallbackEmbedder()

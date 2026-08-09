@@ -29,7 +29,7 @@ def test_store_vectors_and_missing(fresh_env):
     st.upsert_vector(iid, vec)
     assert st.count_vectors() == 1
     got = list(st.iter_vectors())
-    assert got[0][0] == iid and got[0][1] == vec
+    assert got[0] == (iid, store.WHOLE_IMAGE_TILE, vec)
     # silme vektörü de siler
     st.delete_keys(["k2"])
     assert st.count_vectors() == 0

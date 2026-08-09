@@ -3,7 +3,7 @@
 ; Kaynak: PyInstaller çıktısı  dist\DesenArama\  (onedir)
 
 #define AppName "Desen Arama"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "ahmetvural79"
 #define AppExeName "DesenArama.exe"
 

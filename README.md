@@ -29,10 +29,34 @@ Ortak kalite hileleri her yöntemde geçerlidir:
 - **8×TTA (döndürme dayanıklılığı):** sorgudan 0/90/180/270° × yatay ayna ile 8
   varyant üretilir; döndürülmüş taramalar yakalanır. (Ölçümlerde hash modunda
   hit@1'i 0.04 → 0.50'ye çıkardı.)
-- **Renk re-ranking:** "Renk önemi" slider'ıyla `final = (1-α)·desen + α·renk`.
-  "Aynı desen farklı renk" ile "aynı renk ailesi" arasında gezinilir.
+- **Kalibre skorlar:** benzerlik `0` = alakasız, `1` = birebir. Algısal hash'lerde
+  alakasız iki görselin bitlerinin yaklaşık yarısı farklıdır; skor bu tabana göre
+  ölçeklenir, böylece "%50 benzer" görünen alakasız sonuçlar oluşmaz. AI modunda
+  taban **kütüphaneden** öğrenilir: hepsi halı olan bir arşivde DINOv2 alakasız
+  iki deseni bile ~0.88 kosinüsle eşler, bu yüzden skor koleksiyonun kendi
+  medyanına göre yeniden ölçeklenir. Her sonuç ayrıca bir kalite bandıyla
+  (Kopya / Çok benzer / Benzer / Zayıf) etiketlenir.
+- **Kısmi eşleşme (karo indeksleme):** sorgunuz desenin bir *parçasıysa* (motif
+  fotoğrafı, kısmi tarama), tek bir global gömme onu tüm halının taramasıyla
+  eşleştiremez. Ayarlar'dan açılan karo indekslemede her görsel tam kare + N×N
+  karo olarak gömülür ve sorguda karolar arası maksimum alınır. Varsayılan
+  kapalıdır: 3×3 indekslemeyi ~10× yavaşlatır. Sorgunun tamamına ek olarak
+  merkez kırpmasının da aranması (çok ölçekli sorgu) ise ücretsizdir ve
+  varsayılan olarak açıktır.
+- **Model şeffaflığı:** AI modeli yoksa uygulama sessizce zayıf bir yedeğe
+  düşmez — durumu bildirir, indirmeyi (ilerleme + iptal) önerir ve
+  reddedilirse hızlı moda döner. İndirilen dosya SHA256 ile doğrulanır.
+- **Renk re-ranking:** "Renk önemi" slider'ıyla `final = desen · (1-α + α·renk)`.
+  Desen kapıdır; renk en fazla α oranında düzeltme yapar ve deseni eşleşmeyen bir
+  sonucu asla yukarı taşıyamaz. **Varsayılan α = 0**, çünkü halı arşivinde "aynı
+  desen farklı renk" (colorway) birincil senaryodur; aynı renk ailesini öne almak
+  isteyen kullanıcı slider'ı yükseltir.
 - **Kopya rozeti:** pHash Hamming mesafesi eşik altındaki sonuçlar "birebir
   kopya" işaretlenir.
+
+Desteklenen formatlar: **JPEG** (`.jpg .jpeg .jpe .jfif`), **PNG**, **BMP**
+(`.bmp .dib`), **WebP**, **TIFF** (`.tif .tiff`), **TGA** — tümü varsayılan
+olarak indekslenir; Ayarlar'dan tek tek kapatılabilir.
 
 ---
 
@@ -57,6 +81,38 @@ edildi:
   (ağ kopması gerçek silme sanılmaz).
 - **Değişiklik izleme:** yerelde native olaylar, **ağda polling** veya periyodik
   yeniden tarama (SMB olayları güvenilmez olduğundan).
+
+---
+
+## Kurulum (kullanıcı)
+
+[Releases](https://github.com/ahmetvural79/desen-arama/releases) sayfasından
+iki dosyadan biri indirilir:
+
+- `DesenAramaSetup-1.1.0.exe` — kurulum sihirbazı
+- `DesenArama-portable-win64.zip` — kurulum gerektirmez, açıp `DesenArama.exe`
+
+> Windows SmartScreen "bilinmeyen yayımcı" uyarısı verebilir (paket henüz kod
+> imzalı değildir): **Daha fazla bilgi → Yine de çalıştır**.
+
+### İlk çalıştırma
+
+1. **Kütüphane Ekle** ile desen klasörünü seçin (ağ/UNC yolu da olur).
+2. **İndeksle / Güncelle**. Varsayılan "Hızlı (hash)" modu model gerektirmez.
+3. Sorgu görselini sürükleyip bırakın veya **Sorgu Seç**'e tıklayın.
+
+### Daha iyi sonuç için
+
+- Arama yöntemini **"Hibrit — önerilen"** yapın. İlk seçişte ~88 MB'lık DINOv2
+  modelini indirmeyi önerir; ölçümlerde hibrit her senaryoda saf AI'yı geçti.
+- Sorgularınız çoğunlukla desenin bir **parçasıysa** (motif fotoğrafı, kısmi
+  tarama), Ayarlar → *Kısmi eşleşme* bölümünden karo indekslemeyi açın.
+  İndeksleme ~10× yavaşlar; kırpılmış sorgular ancak bu şekilde bulunur.
+- Aynı deseni **aynı renkte** öne almak istiyorsanız "Renk önemi" kaydırıcısını
+  yükseltin. Varsayılan 0'dır: farklı renkli (colorway) varyantlar gömülmesin
+  diye.
+- İnternet erişimi yoksa model dosyasını elle
+  `%LOCALAPPDATA%\DesenArama\models\dinov2_vits14.onnx` konumuna kopyalayın.
 
 ---
 
@@ -106,7 +162,8 @@ desenarama/
   core/            saf Python, GUI'siz, test edilebilir çekirdek
     paths.py       Windows/UNC/uzun-yol + %LOCALAPPDATA% veri dizini
     imageio.py     dayanıklı tek-okuma görsel yükleme + thumbnail
-    hasher.py      pHash/dHash/aHash/wHash (çoklu algısal hash)
+    formats.py     desteklenen görsel uzantıları (tek doğruluk kaynağı)
+    hasher.py      pHash/dHash/aHash/wHash + kalibre benzerlik ölçeği
     hashindex.py   BK-tree + doğrusal Hamming araması
     colorhist.py   HSV renk histogramı (re-ranking)
     embedder.py    ONNX DINOv2 + klasik fallback (model yoksa)

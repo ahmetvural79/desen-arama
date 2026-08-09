@@ -12,7 +12,11 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 
-from .core import paths
+from .core import formats, paths
+
+#: Yapılandırma şeması sürümü. Artırıldığında :meth:`AppConfig._migrate`
+#: eski dosyaları yeni varsayılanlara taşır.
+CONFIG_VERSION = 1
 
 # Arama arka uçları
 BACKEND_HASH = "hash"        # algısal hash + BK-tree (hızlı, AI'sız — varsayılan)
@@ -25,21 +29,55 @@ BACKENDS = (BACKEND_HASH, BACKEND_EMBEDDING, BACKEND_HYBRID)
 class AppConfig:
     # -- kütüphane -- #
     library_roots: list[str] = field(default_factory=list)
-    extensions: list[str] = field(default_factory=lambda: [".jpg", ".jpeg", ".png"])
+    extensions: list[str] = field(default_factory=lambda: list(formats.DEFAULT_EXTENSIONS))
+
+    # -- şema sürümü (göç için) -- #
+    # Varsayılan 0'dır: alanı içermeyen v1.0 dosyaları böylece "göç edilmemiş"
+    # olarak tanınır. Sıfırdan oluşturulan yapılandırma :meth:`load` içinde
+    # güncel sürüme damgalanır.
+    config_version: int = 0
 
     # -- arama arka ucu -- #
     backend: str = BACKEND_HASH
     hash_algo: str = "phash"          # phash | dhash | ahash | whash
     hash_size: int = 8                # 8 => 64-bit; 16 => 256-bit (daha ince)
-    hash_max_distance: int = 12       # bu Hamming eşiği üstü "benzemez" sayılır
+    # Bu Hamming eşiğinin üstü "benzemez" sayılır. **64-bit referansıyla**
+    # verilir; 256-bit hash seçilirse otomatik ölçeklenir (bkz.
+    # :meth:`effective_max_distance`). Eski varsayılan 12 idi ve yalnızca
+    # birebir kopyaları geçiriyordu: aynı desenin kırpılmış veya farklı renkli
+    # varyantları 20–30 bant aralığında kaldığı için hiç sonuç dönmüyordu.
+    hash_max_distance: int = 22
 
     # -- AI (embedding) -- #
     model_key: str = "dinov2-small"   # dinov2-small | dinov2-base
     prefer_gpu: bool = False          # DirectML/CUDA varsa kullan
     tta: bool = True                  # döndürme dayanıklılığı (8x test-time augmentation)
 
+    # Karo (tile) indeksleme: her görsel için tam kare + grid×grid karo gömülür,
+    # sorguda karolar arası maksimum benzerlik alınır. Sorgu, kütüphanedeki bir
+    # görselin **parçası** olduğunda (motif fotoğrafı, kısmi tarama) çalışan tek
+    # yöntemdir.
+    #
+    # Varsayılan 0 = kapalı: 3×3 ızgara indeksleme süresini ve embedding
+    # depolamasını ~10 katına çıkarır. Sorgularınız çoğunlukla kısmi görsellerse
+    # Ayarlar'dan 2 (5×) veya 3 (10×) yapın.
+    tile_grid: int = 0
+
+    # Sorgu tarafında çok ölçeklilik: sorgunun tamamına ek olarak merkez %50
+    # kırpması da aranır. Yalnızca sorgu maliyetidir (indeks büyümez), bu yüzden
+    # varsayılan açıktır.
+    query_multiscale: bool = True
+
     # -- yeniden sıralama -- #
-    color_alpha: float = 0.2          # 0=sadece desen, 1=sadece renk
+    # 0 = yalnızca desen; artan değerler renk uyuşmazlığını cezalandırır
+    # (çarpımsal, bkz. services.search._blend).
+    #
+    # Varsayılan 0'dır: halı arşivinde "aynı desen, farklı renk" (colorway)
+    # birincil bir arama senaryosudur ve renk histogramı kesişimi kalibre
+    # değildir — benzer paletteki alakasız görseller 0.9+ alırken aynı desenin
+    # farklı renkli varyantı 0.0 alır. Renk ağırlığı vermek bu yüzden varsayılan
+    # olarak doğru sonucu gömüyordu. Kullanıcı kaydırıcıyla anında artırabilir.
+    color_alpha: float = 0.0
     rerank_candidates: int = 200      # embedding aramasında yeniden sıralanacak aday sayısı
 
     # -- performans / ağ -- #
@@ -52,8 +90,18 @@ class AppConfig:
     rescan_interval_sec: int = 0      # >0 ise periyodik yeniden tarama (ağ için)
 
     # -- eşikler -- #
-    duplicate_hamming: int = 8        # bu eşik altı "birebir kopya" rozeti
-    score_threshold: float = 0.0      # bu skorun altı sonuç gri gösterilir
+    duplicate_hamming: int = 8        # bu eşik altı "birebir kopya" rozeti (64-bit referans)
+    # Kalibre edilmiş skor ölçeğinde (bkz. hasher.similarity) anlamlı bir taban.
+    # 0.0 iken alakasız her sonuç listeleniyordu.
+    score_threshold: float = 0.35
+
+    def __post_init__(self) -> None:
+        # Dataclass alanı **değildir**: diske yazılmaz, yalnızca bu oturumda
+        # göçün ne değiştirdiğini arayüze taşır.
+        self.migration_notes: list[str] = []
+        # Göç kütüphane kapsamını genişlettiyse mevcut indeks eksiktir; arayüz
+        # yalnızca bu durumda yeniden tarama önerir (eşik değişikliği için gerekmez).
+        self.migration_needs_reindex: bool = False
 
     def config_path(self) -> str:
         return str(paths.data_dir() / "config.json")
@@ -72,14 +120,85 @@ class AppConfig:
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
-                known = {k for k in cls().__dataclass_fields__}  # type: ignore[attr-defined]
-                return cls(**{k: v for k, v in data.items() if k in known})
+                known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
+                cfg = cls(**{k: v for k, v in data.items() if k in known})
+                if cfg._migrate():
+                    cfg.save()
+                return cfg
             except Exception:
                 pass
-        return cls()
+        fresh = cls()
+        fresh.config_version = CONFIG_VERSION
+        return fresh
+
+    # -- göç ---------------------------------------------------------------- #
+    def _migrate(self) -> bool:
+        """Eski yapılandırmayı güncel şemaya taşır; değişiklik olduysa True.
+
+        Göç sonrası hangi alanların değiştiği :attr:`migration_notes` içinde
+        toplanır; arayüz bunu kullanıcıya gösterip yeniden tarama önerir.
+        """
+        self.migration_notes = []
+        self.migration_needs_reindex = False
+        if self.config_version >= CONFIG_VERSION:
+            return False
+
+        # v0 -> v1: uzantı varsayılanı jpg/jpeg/png ile sınırlıydı; BMP, TIFF ve
+        # WebP arşivleri sessizce indekslenmiyordu. Kullanıcı listeyi hiç
+        # özelleştirmediyse (yani tam olarak eski varsayılansa) genişlet.
+        if formats.normalize_all(self.extensions) == set(formats.LEGACY_DEFAULT_EXTENSIONS):
+            self.extensions = list(formats.DEFAULT_EXTENSIONS)
+            added = [e for e in formats.DEFAULT_EXTENSIONS
+                     if e not in formats.LEGACY_DEFAULT_EXTENSIONS]
+            self.migration_notes.append(
+                "Desteklenen görsel formatları genişletildi: " + ", ".join(added)
+            )
+            self.migration_needs_reindex = True
+
+        # v0 -> v1: skor ölçeği kalibre edildi (alakasız görseller artık %50
+        # yerine ~0 alıyor). v1.0'ın eşikleri bu yeni ölçekte yanlış davranır,
+        # bu yüzden kullanıcı özelleştirmediyse (eski varsayılansa) taşı.
+        if self.hash_max_distance == 12:      # v1.0 varsayılanı — kopyadan öteye geçirmiyordu
+            self.hash_max_distance = 22
+            self.migration_notes.append(
+                "Hash arama eşiği 12'den 22'ye çıkarıldı — aynı desenin farklı "
+                "renkli/kırpılmış varyantları artık sonuçlara girebiliyor."
+            )
+        if self.color_alpha == 0.2:           # v1.0 varsayılanı
+            self.color_alpha = 0.0
+            self.migration_notes.append(
+                "Renk ağırlığı 0'a çekildi — aynı desenin farklı renkli "
+                "varyantları artık gömülmüyor. Kaydırıcıdan artırabilirsiniz."
+            )
+        if self.score_threshold == 0.0:       # v1.0 varsayılanı
+            self.score_threshold = 0.35
+            self.migration_notes.append(
+                "Benzerlik skorları kalibre edildi; alakasız sonuçları elemek "
+                "için skor eşiği 0.35'e ayarlandı."
+            )
+
+        self.config_version = CONFIG_VERSION
+        return True
 
     def uses_embedding(self) -> bool:
         return self.backend in (BACKEND_EMBEDDING, BACKEND_HYBRID)
 
     def ext_set(self) -> set[str]:
-        return {e.lower() if e.startswith(".") else "." + e.lower() for e in self.extensions}
+        return formats.normalize_all(self.extensions)
+
+    def hash_bits(self) -> int:
+        return self.hash_size * self.hash_size
+
+    def effective_max_distance(self) -> int:
+        """Seçili hash boyutuna ölçeklenmiş arama eşiği (0 = sınırsız)."""
+        from .core import hasher
+
+        if self.hash_max_distance <= 0:
+            return 0
+        return hasher.scale_distance(self.hash_max_distance, self.hash_bits())
+
+    def effective_duplicate_hamming(self) -> int:
+        """Seçili hash boyutuna ölçeklenmiş kopya eşiği."""
+        from .core import hasher
+
+        return hasher.scale_distance(self.duplicate_hamming, self.hash_bits())

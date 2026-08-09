@@ -64,6 +64,39 @@ class SearchWorker(QObject):
             self.failed.emit(str(e))
 
 
+class ModelDownloadWorker(QObject):
+    """AI modelini arka planda indirir; ilerlemeyi ve sonucu bildirir.
+
+    v1.0'da model indirme ilk aramanın içinde, sessizce ve iptal edilemez
+    biçimde yapılıyordu; başarısız olursa kullanıcı hiçbir şey görmüyordu.
+    """
+
+    progress = Signal(int, int)   # indirilen, toplam (bayt)
+    finished = Signal(str)        # yerel model yolu
+    failed = Signal(str)
+
+    def __init__(self, spec) -> None:
+        super().__init__()
+        self.spec = spec
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        from ..core import models
+
+        try:
+            path = models.download(
+                self.spec,
+                progress=lambda done, total: self.progress.emit(done, total),
+                cancel=lambda: self._cancelled,
+            )
+            self.finished.emit(path)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 def run_in_thread(worker: QObject, on_done=None):
     """Bir worker'ı yeni bir QThread'de çalıştırır; başvuruları döndürür.
 

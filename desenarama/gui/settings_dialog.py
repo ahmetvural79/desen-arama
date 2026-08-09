@@ -6,11 +6,12 @@ import copy
 
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QPushButton, QSpinBox, QVBoxLayout,
-    QFileDialog, QWidget,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QFileDialog, QWidget,
 )
 
 from .. import config as cfg_mod
+from ..core import formats
 
 
 class SettingsDialog(QDialog):
@@ -19,6 +20,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Ayarlar")
         self.resize(560, 620)
         self.updated_config = copy.deepcopy(config)
+        self.extensions_widened = False
         self._build(config)
 
     def _build(self, cfg: cfg_mod.AppConfig) -> None:
@@ -39,15 +41,14 @@ class SettingsDialog(QDialog):
         row.addStretch(1)
         layout.addLayout(row)
 
+        layout.addWidget(self._build_formats_group(cfg))
+
         form = QFormLayout()
 
-        self.ext_edit = QLineEdit(", ".join(cfg.extensions))
-        form.addRow("Uzantılar:", self.ext_edit)
-
         self.backend_combo = QComboBox()
-        for label, val in [("Hızlı (hash)", cfg_mod.BACKEND_HASH),
+        for label, val in [("Hızlı (hash) — model gerektirmez", cfg_mod.BACKEND_HASH),
                            ("AI (DINOv2)", cfg_mod.BACKEND_EMBEDDING),
-                           ("Hibrit", cfg_mod.BACKEND_HYBRID)]:
+                           ("Hibrit — önerilen", cfg_mod.BACKEND_HYBRID)]:
             self.backend_combo.addItem(label, val)
         self.backend_combo.setCurrentIndex(
             [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(cfg.backend)
@@ -70,6 +71,25 @@ class SettingsDialog(QDialog):
         self.model_combo.addItem("DINOv2-B (768, kaliteli)", "dinov2-base")
         self.model_combo.setCurrentIndex(0 if cfg.model_key == "dinov2-small" else 1)
         form.addRow("AI modeli:", self.model_combo)
+
+        self.tile_combo = QComboBox()
+        self.tile_combo.addItem("Kapalı — en hızlı indeksleme", 0)
+        self.tile_combo.addItem("2×2 karo — indeksleme ~5× yavaş", 2)
+        self.tile_combo.addItem("3×3 karo — indeksleme ~10× yavaş", 3)
+        self.tile_combo.setCurrentIndex({0: 0, 2: 1, 3: 2}.get(cfg.tile_grid, 0))
+        self.tile_combo.setToolTip(
+            "Sorgunuz çoğunlukla desenin bir parçasıysa (motif fotoğrafı, kısmi\n"
+            "tarama) açın: her görsel karolara bölünüp ayrı ayrı indekslenir.\n"
+            "Değiştirince embedding'ler yeniden hesaplanır."
+        )
+        form.addRow("Kısmi eşleşme (karo indeksleme):", self.tile_combo)
+
+        self.multiscale_check = QCheckBox(
+            "Çok ölçekli sorgu — sorgunun merkez kırpması da aransın")
+        self.multiscale_check.setChecked(cfg.query_multiscale)
+        self.multiscale_check.setToolTip(
+            "Yalnızca sorgu maliyetidir; indeks büyümez.")
+        form.addRow("", self.multiscale_check)
 
         self.gpu_check = QCheckBox("GPU (DirectML/CUDA) kullan — varsa")
         self.gpu_check.setChecked(cfg.prefer_gpu)
@@ -116,6 +136,46 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    # -- dosya formatları --------------------------------------------------- #
+    def _build_formats_group(self, cfg: cfg_mod.AppConfig):
+        """Uzantı seçimi — serbest metin yerine onay kutuları.
+
+        Eskiden virgülle ayrılmış bir metin kutusuydu; kullanıcının ``.bmp``
+        yazması gerektiğini bilmesi gerekiyordu ve yazım hatası sessizce
+        yutuluyordu. Artık desteklenen her format görünür ve tıklanabilir.
+        """
+        group = QGroupBox("Aranacak dosya formatları")
+        grid = QGridLayout(group)
+        self._initial_exts = formats.normalize_all(cfg.extensions)
+        self.ext_checks: dict[str, QCheckBox] = {}
+
+        for col, (family, exts) in enumerate(formats.FORMAT_FAMILIES):
+            grid.addWidget(QLabel(f"<b>{family}</b>"), 0, col)
+            for row, ext in enumerate(exts, start=1):
+                box = QCheckBox(ext)
+                box.setChecked(ext in self._initial_exts)
+                self.ext_checks[ext] = box
+                grid.addWidget(box, row, col)
+
+        buttons = QHBoxLayout()
+        all_btn = QPushButton("Tümünü seç")
+        all_btn.clicked.connect(lambda: self._set_all_exts(True))
+        none_btn = QPushButton("Hiçbiri")
+        none_btn.clicked.connect(lambda: self._set_all_exts(False))
+        buttons.addWidget(all_btn)
+        buttons.addWidget(none_btn)
+        buttons.addStretch(1)
+        grid.addLayout(buttons, len(max(formats.FORMAT_FAMILIES, key=lambda f: len(f[1]))[1]) + 1,
+                       0, 1, len(formats.FORMAT_FAMILIES))
+        return group
+
+    def _set_all_exts(self, checked: bool) -> None:
+        for box in self.ext_checks.values():
+            box.setChecked(checked)
+
+    def _selected_exts(self) -> list[str]:
+        return [e for e, box in self.ext_checks.items() if box.isChecked()]
+
     def _add_root(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Klasör seç")
         if folder:
@@ -127,12 +187,26 @@ class SettingsDialog(QDialog):
 
     def _accept(self) -> None:
         c = self.updated_config
+        selected = self._selected_exts()
+        if not selected:
+            QMessageBox.warning(
+                self, "Format seçilmedi",
+                "En az bir dosya formatı seçmelisiniz; aksi hâlde hiçbir görsel "
+                "indekslenmez.",
+            )
+            return
+        #: Yeni format eklendiyse mevcut indeks o dosyaları içermez — arayüz
+        #: bu bayrağa bakıp yeniden tarama önerir.
+        self.extensions_widened = bool(set(selected) - self._initial_exts)
+
         c.library_roots = [self.roots_list.item(i).text() for i in range(self.roots_list.count())]
-        c.extensions = [e.strip() for e in self.ext_edit.text().split(",") if e.strip()]
+        c.extensions = selected
         c.backend = self.backend_combo.currentData()
         c.hash_algo = self.hash_algo.currentText()
         c.hash_size = self.hash_size.currentData()
         c.model_key = self.model_combo.currentData()
+        c.tile_grid = self.tile_combo.currentData()
+        c.query_multiscale = self.multiscale_check.isChecked()
         c.prefer_gpu = self.gpu_check.isChecked()
         c.duplicate_hamming = self.dup_spin.value()
         c.hash_max_distance = self.maxdist_spin.value()

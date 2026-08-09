@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .hasher import hamming
+from .hasher import hamming, similarity
 
 
 @dataclass
@@ -89,7 +89,7 @@ class BKTree:
 class HashSearchResult:
     image_id: int
     distance: int
-    similarity: float  # 0..1 (1 = birebir)
+    similarity: float  # 0..1 kalibre (bkz. hasher.similarity; alakasız = 0)
 
 
 class HashIndex:
@@ -134,7 +134,7 @@ class HashIndex:
         if self._tree is not None and max_distance is not None:
             raw = self._tree.query(query_hash, max_distance)
             hits = [
-                HashSearchResult(img_id, d, 1.0 - d / bits) for img_id, d in raw
+                HashSearchResult(img_id, d, similarity(d, bits)) for img_id, d in raw
             ]
             return hits[:k]
 
@@ -144,6 +144,6 @@ class HashIndex:
             d = int(query_hash ^ h).bit_count()
             if max_distance is not None and d > max_distance:
                 continue
-            scored.append(HashSearchResult(image_id, d, 1.0 - d / bits))
+            scored.append(HashSearchResult(image_id, d, similarity(d, bits)))
         scored.sort(key=lambda r: r.distance)
         return scored[:k]

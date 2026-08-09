@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageFile
 
 from . import paths
+from .formats import DEFAULT_EXTENSIONS, SUPPORTED_EXTENSIONS  # noqa: F401 (yeniden dışa aktarım)
 
 # Kısmen bozuk JPEG'lerin hattı düşürmemesi için toleranslı çözme.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -22,10 +23,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # None yaparsak dev dosyalar belleği tüketebilir; çok küçük yaparsak meşru
 # yüksek çözünürlüklü taramalar reddedilir.
 Image.MAX_IMAGE_PIXELS = 200_000_000
-
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-DEFAULT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
-
 
 class ImageLoadError(Exception):
     """Dosya okunamadı / çözülemedi (bozuk, erişim reddi, desteklenmeyen)."""

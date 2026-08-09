@@ -123,6 +123,43 @@ def hamming(a: int, b: int) -> int:
     return int(a ^ b).bit_count()
 
 
+#: Birbiriyle **alakasız** iki görselin beklenen Hamming mesafesinin bit
+#: sayısına oranı. Algısal hash'ler rastgele iki görselde bitlerin yaklaşık
+#: yarısını farklı üretir, yani 64-bit hash'te alakasızlığın beklenen değeri
+#: ~32'dir (bkz. Hamming distributions of popular perceptual hashing techniques,
+#: arXiv 2212.08035).
+UNRELATED_DISTANCE_RATIO = 0.5
+
+
+def similarity(distance: int, bits: int = 64) -> float:
+    """Hamming mesafesini **kalibre edilmiş** 0..1 benzerliğe çevirir.
+
+    Eski formül ``1 - d/bits`` idi ve alakasız görselleri %50 benzer
+    gösteriyordu: kullanıcı arayüzünde her şey "yarı benzer" görünüyor,
+    eşik ayarı anlamsızlaşıyordu. Burada alakasızlık tabanı (``bits/2``)
+    sıfıra oturtulur:
+
+    * ``d = 0``        → 1.0 (birebir)
+    * ``d = bits/4``   → 0.5
+    * ``d >= bits/2``  → 0.0 (alakasız)
+
+    Hash boyutundan bağımsızdır; 256-bit hash'te otomatik ölçeklenir.
+    """
+    baseline = bits * UNRELATED_DISTANCE_RATIO
+    if baseline <= 0:
+        return 0.0
+    return max(0.0, (baseline - distance) / baseline)
+
+
+def scale_distance(distance_at_64: int, bits: int) -> int:
+    """64-bit için tanımlı bir mesafe eşiğini ``bits``-bitlik hash'e ölçekler.
+
+    Ayarlardaki eşikler 64-bit referansıyla girilir; kullanıcı 256-bit'e
+    geçtiğinde eşiğin elle dört katına çıkarılması beklenemez.
+    """
+    return max(0, round(distance_at_64 * bits / 64))
+
+
 def to_blob(value: int, hash_size: int = 8) -> bytes:
     """Hash tamsayısını SQLite BLOB olarak sabit uzunlukta serileştirir."""
     nbytes = (hash_size * hash_size + 7) // 8

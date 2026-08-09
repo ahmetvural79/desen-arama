@@ -9,21 +9,29 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
+from PySide6.QtCore import Qt, QEventLoop, QSize, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap, QKeySequence
 from PySide6.QtWidgets import (
-    QComboBox, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QSpinBox, QVBoxLayout, QWidget, QToolBar, QStatusBar,
+    QApplication, QComboBox, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QProgressDialog, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QToolBar, QStatusBar,
 )
 
 from .. import __app_name__, __version__, config as cfg_mod
-from ..core import osutil, paths
+from ..core import formats, osutil, paths
 from ..services.engine import Engine
 from .settings_dialog import SettingsDialog
-from .workers import IndexWorker, SearchWorker, run_in_thread
+from .workers import IndexWorker, ModelDownloadWorker, SearchWorker, run_in_thread
 
 THUMB_ICON = 190
+
+#: Kalite bandı → simge. Skor yüzdesi tek başına yanıltıcıydı; bant ile
+#: birlikte gösterilir (bkz. SearchResult.quality).
+_QUALITY_ICON = {
+    "Kopya": "🟢", "Çok benzer": "🟢", "Benzer": "🟡",
+    "Zayıf": "🟠", "Çok zayıf": "⚪",
+}
 
 
 class _WatchBridge(QObject):
@@ -54,9 +62,7 @@ class QueryDropLabel(QLabel):
     def dropEvent(self, e):
         for url in e.mimeData().urls():
             path = url.toLocalFile()
-            if path and os.path.splitext(path)[1].lower() in {
-                ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"
-            }:
+            if path and formats.is_supported(os.path.splitext(path)[1]):
                 self._on_image(path)
                 break
 
@@ -85,6 +91,23 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_status()
         self._setup_watch()
+        # Yapılandırma göçü pencere görünür olduktan sonra bildirilir.
+        QTimer.singleShot(0, self._announce_migration)
+
+    def _announce_migration(self) -> None:
+        """Yapılandırma göçü kapsamı genişlettiyse kullanıcıyı bilgilendirir."""
+        notes = getattr(self.config, "migration_notes", None)
+        if not notes:
+            return
+        self.config.migration_notes = []  # bir kez göster
+        body = "Ayarlarınız yeni sürüme taşındı:\n\n• " + "\n• ".join(notes)
+        if getattr(self.config, "migration_needs_reindex", False):
+            self._offer_reindex(
+                body + "\n\nMevcut indeks yeni formattaki görselleri içermiyor.\n"
+                       "Kütüphane şimdi yeniden taransın mı?"
+            )
+        else:
+            QMessageBox.information(self, "Ayarlar güncellendi", body)
 
     # -- arayüz kurulumu ---------------------------------------------------- #
     def _build_ui(self) -> None:
@@ -107,7 +130,12 @@ class MainWindow(QMainWindow):
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("Hızlı (hash) — aynı/benzer şekil", cfg_mod.BACKEND_HASH)
         self.backend_combo.addItem("AI (DINOv2) — derin benzerlik", cfg_mod.BACKEND_EMBEDDING)
-        self.backend_combo.addItem("Hibrit — hash + AI yeniden sıralama", cfg_mod.BACKEND_HYBRID)
+        # Ölçümde hibrit, saf embedding'i her senaryoda geçti (hit@10 0.98 vs
+        # 0.85) ve sorgu süresi aynı kaldı: hash colorway varyantlarında,
+        # embedding kırpılmış/kısmi sorgularda güçlü; hibrit ikisinin en iyisini
+        # alıyor. Model kuruluysa önerilen seçenek budur.
+        self.backend_combo.addItem(
+            "Hibrit — hash + AI birlikte (önerilen)", cfg_mod.BACKEND_HYBRID)
         self.backend_combo.setCurrentIndex(
             [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(self.config.backend)
         )
@@ -208,8 +236,7 @@ class MainWindow(QMainWindow):
     # -- sorgu -------------------------------------------------------------- #
     def _pick_query(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Sorgu görseli seç", "",
-            "Görseller (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)",
+            self, "Sorgu görseli seç", "", formats.qt_name_filter(),
         )
         if path:
             self._set_query(path)
@@ -225,11 +252,84 @@ class MainWindow(QMainWindow):
         self.config.save()
         # AI/hibrit moduna geçildiyse ve vektör yoksa kullanıcıyı uyar
         if self.config.uses_embedding():
+            if not self.engine.model_available() and not self._offer_model_download():
+                return
             self.engine.open()  # vektör indeksini yüklemeyi dene
             if self.engine.store.count_vectors() == 0 and self.engine.store.count("ok") > 0:
                 self.status_label.setText(
                     "AI modu seçildi — 'İndeksle / Güncelle' ile embedding'leri üretin."
                 )
+
+    # -- AI modeli ---------------------------------------------------------- #
+    def _offer_model_download(self) -> bool:
+        """AI modeli eksikse indirmeyi önerir; hazır olduğunda ``True`` döner.
+
+        v1.0 modeli bulamadığında sessizce çok daha zayıf bir yedek çıkarıcıya
+        düşüyordu ve kullanıcı bunu asla öğrenmiyordu. Artık durum açıkça
+        gösterilir ve seçim kullanıcıya bırakılır.
+        """
+        spec = self.engine.model_spec()
+        mb = spec.size_bytes / (1024 * 1024)
+        answer = QMessageBox.question(
+            self, "AI modeli gerekli",
+            f"'{spec.note}' modeli bilgisayarınızda yok.\n\n"
+            f"Bir kez indirilmesi gerekiyor (~{mb:.0f} MB). İndirilsin mi?\n\n"
+            "Hayır derseniz arama yöntemi 'Hızlı (hash)' olarak kalır.\n"
+            f"Çevrimdışı kurulum için dosyayı şu klasöre kopyalayabilirsiniz:\n"
+            f"{paths.models_dir()}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            self._revert_to_hash_backend()
+            return False
+        return self._download_model(spec)
+
+    def _download_model(self, spec) -> bool:
+        dialog = QProgressDialog("AI modeli indiriliyor…", "İptal", 0, 100, self)
+        dialog.setWindowTitle("Model indiriliyor")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+
+        worker = ModelDownloadWorker(spec)
+        outcome: dict = {}
+
+        def on_progress(done: int, total: int) -> None:
+            if total:
+                dialog.setValue(int(done * 100 / total))
+                dialog.setLabelText(
+                    f"AI modeli indiriliyor… {done / 1048576:.0f} / {total / 1048576:.0f} MB"
+                )
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(lambda path: outcome.update(ok=True))
+        worker.failed.connect(lambda msg: outcome.update(ok=False, error=msg))
+        dialog.canceled.connect(worker.cancel)
+
+        thread, _ = run_in_thread(worker)
+        self._threads.append((thread, worker))
+        # İndirme bitene kadar olay döngüsünü çevir; pencere yanıt vermeye devam
+        # eder. WaitForMoreEvents olmadan bu döngü boşta dönerek bir çekirdeği
+        # doldurur — 88 MB'lık bir indirme boyunca fark edilir.
+        while not outcome:
+            QApplication.processEvents(QEventLoop.AllEvents | QEventLoop.WaitForMoreEvents, 50)
+        dialog.close()
+
+        if outcome.get("ok"):
+            self.status_label.setText("AI modeli hazır.")
+            return True
+        QMessageBox.warning(self, "Model indirilemedi", outcome.get("error", "Bilinmeyen hata"))
+        self._revert_to_hash_backend()
+        return False
+
+    def _revert_to_hash_backend(self) -> None:
+        """AI kullanılamıyorsa hızlı moda dön — sessizce bozuk sonuç üretme."""
+        self.config.backend = cfg_mod.BACKEND_HASH
+        self.config.save()
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setCurrentIndex(0)
+        self.backend_combo.blockSignals(False)
+        self.status_label.setText("Arama yöntemi 'Hızlı (hash)' olarak ayarlandı.")
 
     def _on_tta_changed(self, checked: bool) -> None:
         self.config.tta = checked
@@ -260,6 +360,11 @@ class MainWindow(QMainWindow):
         if not self.config.library_roots:
             QMessageBox.warning(self, "Kütüphane yok", "Önce bir kütüphane klasörü ekleyin.")
             return
+        # AI modunda indeksleme model olmadan çalışamaz; uzun bir taramanın
+        # ortasında değil, başlamadan önce hallet.
+        if self.config.uses_embedding() and not self.engine.model_available():
+            if not self._offer_model_download():
+                return
         self.index_action.setEnabled(False)
         self.cancel_action.setEnabled(True)
         self.progress.setVisible(True)
@@ -335,11 +440,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             if r.thumb_path and os.path.exists(r.thumb_path):
                 item.setIcon(QIcon(QPixmap(r.thumb_path)))
-            badge = "  🟢KOPYA" if r.is_duplicate else ""
             name = os.path.basename(r.path)
-            item.setText(f"%{r.score*100:.0f}{badge}\n{name}")
-            tip = (f"{r.path}\nSkor: {r.score:.3f} (desen {r.pattern_score:.3f}, "
-                   f"renk {r.color_sim:.3f})")
+            item.setText(f"%{r.score*100:.0f}  {_QUALITY_ICON[r.quality()]}{r.quality()}\n{name}")
+            tip = (f"{r.path}\nSkor: %{r.score*100:.0f} — {r.quality()}\n"
+                   f"(desen {r.pattern_score:.3f}, renk {r.color_sim:.3f})")
             if r.hamming is not None:
                 tip += f"\npHash mesafesi: {r.hamming}"
             tip += f"\nBoyut: {r.width}×{r.height}"
@@ -396,6 +500,26 @@ class MainWindow(QMainWindow):
             self._sync_controls()
             self._refresh_status()
             self._setup_watch()  # izleme ayarları değişmiş olabilir
+            if dlg.extensions_widened:
+                self._offer_reindex(
+                    "Yeni dosya formatları eklendi. Mevcut indeks bu formattaki "
+                    "görselleri içermiyor.\n\nKütüphane şimdi yeniden taransın mı?"
+                )
+
+    def _offer_reindex(self, message: str) -> None:
+        """Kapsam değiştiğinde artımlı taramayı kullanıcıya önerir.
+
+        Tarama artımlıdır: zaten indekslenmiş dosyalar yeniden işlenmez, yalnızca
+        yeni görünür hâle gelen dosyalar eklenir.
+        """
+        if not self.config.library_roots:
+            return
+        answer = QMessageBox.question(
+            self, "Yeniden tarama", message,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self._start_index()
 
     def _sync_controls(self) -> None:
         idx = [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(self.config.backend)

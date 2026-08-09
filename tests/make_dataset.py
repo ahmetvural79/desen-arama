@@ -7,8 +7,11 @@ bordürler, madalyonlar. Her "aile" için varyantlar üretilir:
 * farklı renk (colorway) — aynı desen, farklı palet
 * döndürülmüş tarama (90°)
 * yeniden sıkıştırılmış/küçültülmüş kopya (birebir kopya senaryosu)
+* **kırpılmış / yakın çekim** — desenin bir parçası (BMP olarak yazılır)
 
-Böylece Recall@k, TTA katkısı ve renk re-ranking gerçekçi biçimde ölçülebilir.
+Böylece Recall@k, TTA katkısı, renk re-ranking ve karo indeksleme gerçekçi
+biçimde ölçülebilir. Kırpma senaryosu bilerek BMP'dir: format kapsaması da
+ölçüm hattında sınanır.
 """
 
 from __future__ import annotations
@@ -88,18 +91,25 @@ def build(out_dir: str, n_families: int = 12) -> dict:
         small = np.asarray(Image.fromarray(orig).resize((160, 160)).resize((256, 256)))
         _save(out_dir, f"fam{fam}_copy.jpg", small, labels, fam, jpeg=True)
 
+        # kırpılmış / yakın çekim: desenin merkez ~%45'i, BMP olarak
+        c0, c1 = int(256 * 0.28), int(256 * 0.72)
+        crop = np.ascontiguousarray(orig[c0:c1, c0:c1])
+        _save(out_dir, f"fam{fam}_crop.bmp", crop, labels, fam, fmt="BMP")
+
         manifest["families"][fam] = [
             f"fam{fam}_orig.png", f"fam{fam}_recolor.png",
-            f"fam{fam}_rot90.png", f"fam{fam}_copy.jpg",
+            f"fam{fam}_rot90.png", f"fam{fam}_copy.jpg", f"fam{fam}_crop.bmp",
         ]
 
     return {"labels": labels, "manifest": manifest, "dir": out_dir}
 
 
-def _save(out_dir, name, arr, labels, fam, jpeg=False):
+def _save(out_dir, name, arr, labels, fam, jpeg=False, fmt=None):
     im = Image.fromarray(arr)
     path = os.path.join(out_dir, name)
-    if jpeg:
+    if fmt:
+        im.save(path, fmt)
+    elif jpeg:
         im.save(path, quality=85)
     else:
         im.save(path)
