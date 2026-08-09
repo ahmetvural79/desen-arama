@@ -18,12 +18,19 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __app_name__, __version__, config as cfg_mod
-from ..core import osutil, paths
+from ..core import formats, osutil, paths
 from ..services.engine import Engine
 from .settings_dialog import SettingsDialog
 from .workers import IndexWorker, SearchWorker, run_in_thread
 
 THUMB_ICON = 190
+
+#: Kalite bandı → simge. Skor yüzdesi tek başına yanıltıcıydı; bant ile
+#: birlikte gösterilir (bkz. SearchResult.quality).
+_QUALITY_ICON = {
+    "Kopya": "🟢", "Çok benzer": "🟢", "Benzer": "🟡",
+    "Zayıf": "🟠", "Çok zayıf": "⚪",
+}
 
 
 class _WatchBridge(QObject):
@@ -54,9 +61,7 @@ class QueryDropLabel(QLabel):
     def dropEvent(self, e):
         for url in e.mimeData().urls():
             path = url.toLocalFile()
-            if path and os.path.splitext(path)[1].lower() in {
-                ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"
-            }:
+            if path and formats.is_supported(os.path.splitext(path)[1]):
                 self._on_image(path)
                 break
 
@@ -85,6 +90,23 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_status()
         self._setup_watch()
+        # Yapılandırma göçü pencere görünür olduktan sonra bildirilir.
+        QTimer.singleShot(0, self._announce_migration)
+
+    def _announce_migration(self) -> None:
+        """Yapılandırma göçü kapsamı genişlettiyse kullanıcıyı bilgilendirir."""
+        notes = getattr(self.config, "migration_notes", None)
+        if not notes:
+            return
+        self.config.migration_notes = []  # bir kez göster
+        body = "Ayarlarınız yeni sürüme taşındı:\n\n• " + "\n• ".join(notes)
+        if getattr(self.config, "migration_needs_reindex", False):
+            self._offer_reindex(
+                body + "\n\nMevcut indeks yeni formattaki görselleri içermiyor.\n"
+                       "Kütüphane şimdi yeniden taransın mı?"
+            )
+        else:
+            QMessageBox.information(self, "Ayarlar güncellendi", body)
 
     # -- arayüz kurulumu ---------------------------------------------------- #
     def _build_ui(self) -> None:
@@ -208,8 +230,7 @@ class MainWindow(QMainWindow):
     # -- sorgu -------------------------------------------------------------- #
     def _pick_query(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Sorgu görseli seç", "",
-            "Görseller (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)",
+            self, "Sorgu görseli seç", "", formats.qt_name_filter(),
         )
         if path:
             self._set_query(path)
@@ -335,11 +356,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             if r.thumb_path and os.path.exists(r.thumb_path):
                 item.setIcon(QIcon(QPixmap(r.thumb_path)))
-            badge = "  🟢KOPYA" if r.is_duplicate else ""
             name = os.path.basename(r.path)
-            item.setText(f"%{r.score*100:.0f}{badge}\n{name}")
-            tip = (f"{r.path}\nSkor: {r.score:.3f} (desen {r.pattern_score:.3f}, "
-                   f"renk {r.color_sim:.3f})")
+            item.setText(f"%{r.score*100:.0f}  {_QUALITY_ICON[r.quality()]}{r.quality()}\n{name}")
+            tip = (f"{r.path}\nSkor: %{r.score*100:.0f} — {r.quality()}\n"
+                   f"(desen {r.pattern_score:.3f}, renk {r.color_sim:.3f})")
             if r.hamming is not None:
                 tip += f"\npHash mesafesi: {r.hamming}"
             tip += f"\nBoyut: {r.width}×{r.height}"
@@ -396,6 +416,26 @@ class MainWindow(QMainWindow):
             self._sync_controls()
             self._refresh_status()
             self._setup_watch()  # izleme ayarları değişmiş olabilir
+            if dlg.extensions_widened:
+                self._offer_reindex(
+                    "Yeni dosya formatları eklendi. Mevcut indeks bu formattaki "
+                    "görselleri içermiyor.\n\nKütüphane şimdi yeniden taransın mı?"
+                )
+
+    def _offer_reindex(self, message: str) -> None:
+        """Kapsam değiştiğinde artımlı taramayı kullanıcıya önerir.
+
+        Tarama artımlıdır: zaten indekslenmiş dosyalar yeniden işlenmez, yalnızca
+        yeni görünür hâle gelen dosyalar eklenir.
+        """
+        if not self.config.library_roots:
+            return
+        answer = QMessageBox.question(
+            self, "Yeniden tarama", message,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self._start_index()
 
     def _sync_controls(self) -> None:
         idx = [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(self.config.backend)

@@ -13,7 +13,8 @@ Ortak kalite hileleri:
 * **8×TTA (döndürme dayanıklılığı):** sorgudan 0/90/180/270° × yatay ayna ile
   8 varyant üretilir; her aday için varyantlar arası en iyi skor alınır. CNN/ViT
   ve hash'ler döndürmeye duyarlı olduğundan bu, döndürülmüş taramaları yakalar.
-* **Renk re-ranking:** ``final = (1-α)·desen_skoru + α·renk_benzerliği``.
+* **Renk re-ranking:** ``final = desen_skoru · (1-α + α·renk_benzerliği)`` —
+  desen kapıdır, renk en fazla α oranında düzeltme yapar (bkz. :func:`_blend`).
 * **Kopya rozeti:** pHash Hamming mesafesi eşik altındaki sonuçlar "birebir
   kopya" işaretlenir.
 """
@@ -45,6 +46,57 @@ class SearchResult:
     width: int
     height: int
     below_threshold: bool
+
+    def quality(self) -> str:
+        """Skoru kullanıcının okuyabileceği bir kalite bandına çevirir.
+
+        Ham yüzde tek başına yanıltıcıydı; bant, skorun kalibre edilmiş
+        ölçekte ne anlama geldiğini açık eder.
+        """
+        if self.is_duplicate:
+            return "Kopya"
+        if self.score >= 0.75:
+            return "Çok benzer"
+        if self.score >= 0.50:
+            return "Benzer"
+        if self.score >= 0.35:
+            return "Zayıf"
+        return "Çok zayıf"
+
+
+def _cosine_to_score(cos: float) -> float:
+    """Kosinüs benzerliğini kalibre edilmiş 0..1 skora çevirir.
+
+    Eski eşleme ``(cos + 1) / 2`` idi ve **negatif tarafı boşa harcıyordu**:
+    embedding uzayında alakasız iki görselin kosinüsü 0 civarındadır, negatif
+    değerler pratikte görülmez. Sonuç olarak alakasız her şey %50 skor
+    alıyordu. Doğrudan kırpma, hash tarafındaki kalibrasyonla aynı ölçeği verir:
+    alakasız ≈ 0, birebir = 1.
+    """
+    return max(0.0, min(1.0, cos))
+
+
+def _blend(pattern: float, color_sim: float | None, alpha: float) -> float:
+    """Desen skorunu renk benzerliğiyle harmanlar — **çarpımsal** modülasyon.
+
+    Eski formül toplamsaldı: ``(1-α)·desen + α·renk``. Renk histogramı kesişimi
+    kalibre değildir; benzer paletteki **alakasız** görseller 0.9+ alırken, aynı
+    desenin farklı renkli (colorway) varyantı 0.0 alır. Toplamsal harmanda bu,
+    α=0.2'de bile sıralamayı tersine çeviriyordu: alakasız görseller aynı desenin
+    farklı renkli hâlinin üstüne çıkıyordu (ölçümle doğrulandı).
+
+    Çarpımsal formda desen **kapı**, renk ise en fazla ``α`` oranında bir
+    düzeltmedir; renk asla desen eşleşmesi olmayan bir sonucu yukarı taşıyamaz:
+
+    * ``α = 0``   → yalnızca desen
+    * ``α = 0.2`` → renk uyuşmazlığı skoru en çok %20 düşürür
+    * ``α = 1``   → renk uyuşmayan desen eşleşmeleri tamamen elenir
+
+    Renk bilgisi olmayan kayıtlarda (eski indeks) modülasyon uygulanmaz.
+    """
+    if color_sim is None or alpha <= 0.0:
+        return pattern
+    return pattern * (1.0 - alpha + alpha * color_sim)
 
 
 def _tta_variants(rgb: np.ndarray) -> list[np.ndarray]:
@@ -96,7 +148,8 @@ class SearchService:
         hs = self.config.hash_size
         algo = self.config.hash_algo
         variants = _tta_variants(rgb) if self.config.tta else [rgb]
-        max_dist = self.config.hash_max_distance
+        # Eşik 64-bit referansıyla saklanır; seçili hash boyutuna ölçeklenir.
+        max_dist = self.config.effective_max_distance()
         best: dict[int, float] = {}
         # Aday sayısını geniş tut (renk re-rank için) — k'nın birkaç katı.
         cand_k = max(k * 3, 100)
@@ -130,8 +183,7 @@ class SearchService:
                 s = float(scores[vi_row, j])
                 if s > best.get(img_id, -2.0):
                     best[img_id] = s
-        # kosinüs -1..1 → 0..1 normalize
-        return {i: (s + 1.0) / 2.0 for i, s in best.items()}
+        return {i: _cosine_to_score(s) for i, s in best.items()}
 
     # -- hibrit ------------------------------------------------------------- #
     def _search_hybrid(self, rgb: np.ndarray, k: int) -> dict[int, float]:
@@ -154,7 +206,7 @@ class SearchService:
             cand = np.frombuffer(cur["vec"], dtype=np.float32).copy()
             cand /= (np.linalg.norm(cand) + 1e-9)
             sim = float(np.max(qv @ cand))  # varyantlar arası en iyi kosinüs
-            result[img_id] = (sim + 1.0) / 2.0
+            result[img_id] = _cosine_to_score(sim)
         return result
 
     # -- ortak son işleme --------------------------------------------------- #
@@ -169,7 +221,7 @@ class SearchService:
             [hasher.compute(v, "phash", self.config.hash_size) for v in _tta_variants(rgb)]
             if self.config.tta else [q_phash]
         )
-        dup_thr = self.config.duplicate_hamming
+        dup_thr = self.config.effective_duplicate_hamming()
         thr = self.config.score_threshold
 
         results: list[SearchResult] = []
@@ -178,9 +230,10 @@ class SearchService:
             if rec is None or rec.status != "ok":
                 continue
             color_sim = 0.0
-            if rec.color:
+            has_color = bool(rec.color)
+            if has_color:
                 color_sim = colorhist.similarity(q_color, colorhist.from_blob(rec.color))
-            final = (1.0 - alpha) * pat + alpha * color_sim
+            final = _blend(pat, color_sim if has_color else None, alpha)
             ham = None
             is_dup = False
             if rec.phash:

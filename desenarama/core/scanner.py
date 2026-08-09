@@ -17,8 +17,8 @@ import logging
 import os
 from dataclasses import dataclass
 
-from . import paths
-from .imageio import DEFAULT_EXTENSIONS
+from . import formats, paths
+from .formats import DEFAULT_EXTENSIONS
 
 log = logging.getLogger("desenarama.scanner")
 
@@ -55,7 +55,9 @@ def iter_images(root: str, extensions: set[str] | None = None, follow_symlinks: 
 
     Erişilemeyen dizinler atlanır ve loglanır; tarama kesintisiz sürer.
     """
-    exts = {e.lower() for e in (extensions or DEFAULT_EXTENSIONS)}
+    # Nokta eksik ("jpg") veya büyük harfli (".JPG") girdiler de kabul edilir;
+    # ayarlardan elle yazılan uzantıların sessizce eşleşmemesini önler.
+    exts = formats.normalize_all(extensions or DEFAULT_EXTENSIONS)
     stack = [root]
     while stack:
         current = stack.pop()

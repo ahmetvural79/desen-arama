@@ -29,10 +29,21 @@ Ortak kalite hileleri her yöntemde geçerlidir:
 - **8×TTA (döndürme dayanıklılığı):** sorgudan 0/90/180/270° × yatay ayna ile 8
   varyant üretilir; döndürülmüş taramalar yakalanır. (Ölçümlerde hash modunda
   hit@1'i 0.04 → 0.50'ye çıkardı.)
-- **Renk re-ranking:** "Renk önemi" slider'ıyla `final = (1-α)·desen + α·renk`.
-  "Aynı desen farklı renk" ile "aynı renk ailesi" arasında gezinilir.
+- **Kalibre skorlar:** benzerlik `0` = alakasız, `1` = birebir. Algısal hash'lerde
+  alakasız iki görselin bitlerinin yaklaşık yarısı farklıdır; skor bu tabana göre
+  ölçeklenir, böylece "%50 benzer" görünen alakasız sonuçlar oluşmaz. Her sonuç
+  ayrıca bir kalite bandıyla (Kopya / Çok benzer / Benzer / Zayıf) etiketlenir.
+- **Renk re-ranking:** "Renk önemi" slider'ıyla `final = desen · (1-α + α·renk)`.
+  Desen kapıdır; renk en fazla α oranında düzeltme yapar ve deseni eşleşmeyen bir
+  sonucu asla yukarı taşıyamaz. **Varsayılan α = 0**, çünkü halı arşivinde "aynı
+  desen farklı renk" (colorway) birincil senaryodur; aynı renk ailesini öne almak
+  isteyen kullanıcı slider'ı yükseltir.
 - **Kopya rozeti:** pHash Hamming mesafesi eşik altındaki sonuçlar "birebir
   kopya" işaretlenir.
+
+Desteklenen formatlar: **JPEG** (`.jpg .jpeg .jpe .jfif`), **PNG**, **BMP**
+(`.bmp .dib`), **WebP**, **TIFF** (`.tif .tiff`), **TGA** — tümü varsayılan
+olarak indekslenir; Ayarlar'dan tek tek kapatılabilir.
 
 ---
 
@@ -106,7 +117,8 @@ desenarama/
   core/            saf Python, GUI'siz, test edilebilir çekirdek
     paths.py       Windows/UNC/uzun-yol + %LOCALAPPDATA% veri dizini
     imageio.py     dayanıklı tek-okuma görsel yükleme + thumbnail
-    hasher.py      pHash/dHash/aHash/wHash (çoklu algısal hash)
+    formats.py     desteklenen görsel uzantıları (tek doğruluk kaynağı)
+    hasher.py      pHash/dHash/aHash/wHash + kalibre benzerlik ölçeği
     hashindex.py   BK-tree + doğrusal Hamming araması
     colorhist.py   HSV renk histogramı (re-ranking)
     embedder.py    ONNX DINOv2 + klasik fallback (model yoksa)
