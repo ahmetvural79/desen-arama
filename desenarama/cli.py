@@ -160,7 +160,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
-    return args.func(args)
+    from .core.embedder import EmbedderUnavailable
+
+    try:
+        return args.func(args)
+    except EmbedderUnavailable as e:
+        # Yığın izi yerine ne yapılacağını söyle: v1.0 bu durumda sessizce
+        # zayıf bir yedeğe düşüp yanıltıcı sonuçlar üretiyordu.
+        print(f"Hata: {e}", file=sys.stderr)
+        print("\nSeçenekler:\n"
+              "  • Ağ erişimi varsa komutu tekrar çalıştırın (model indirilir).\n"
+              "  • Model dosyasını elle indirip models/ dizinine kopyalayın.\n"
+              "  • '--backend hash' ile AI'sız hızlı modu kullanın.", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

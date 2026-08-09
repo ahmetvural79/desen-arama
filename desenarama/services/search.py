@@ -64,15 +64,32 @@ class SearchResult:
         return "Çok zayıf"
 
 
-def _cosine_to_score(cos: float) -> float:
+def _cosine_to_score(cos: float, baseline: float = 0.0) -> float:
     """Kosinüs benzerliğini kalibre edilmiş 0..1 skora çevirir.
 
-    Eski eşleme ``(cos + 1) / 2`` idi ve **negatif tarafı boşa harcıyordu**:
-    embedding uzayında alakasız iki görselin kosinüsü 0 civarındadır, negatif
-    değerler pratikte görülmez. Sonuç olarak alakasız her şey %50 skor
-    alıyordu. Doğrudan kırpma, hash tarafındaki kalibrasyonla aynı ölçeği verir:
-    alakasız ≈ 0, birebir = 1.
+    İki katmanlı bir düzeltmedir.
+
+    **1. Negatif tarafı boşa harcama.** Eski eşleme ``(cos + 1) / 2`` idi;
+    embedding uzayında alakasız iki görselin kosinüsü 0 civarında olduğundan
+    alakasız her şey %50 skor alıyordu.
+
+    **2. Kütüphaneye göre taban alma.** DINOv2 kosinüsleri dar ve yüksek bir
+    bantta yaşar; hepsi halı olan bir arşivde **alakasız** iki desen bile ~0.89
+    kosinüs verir (ölçüldü). Sabit bir ölçek bu yüzden yine "her şey %90 benzer"
+    üretir. ``baseline`` kütüphaneden alınan temsilî örneklemin medyanıdır;
+    skor bu tabanın üstündeki paya göre yeniden ölçeklenir:
+
+        skor = (cos - taban) / (1 - taban)
+
+    Böylece tipik bir kütüphane üyesi 0, birebir eşleşme 1 alır ve ölçek
+    koleksiyonun kendi dağılımına uyarlanır (fotoğraf arşivi ile halı arşivi
+    aynı formülle doğru davranır).
     """
+    if baseline > 0.0:
+        span = 1.0 - baseline
+        if span <= 1e-6:
+            return 1.0 if cos >= baseline else 0.0
+        cos = (cos - baseline) / span
     return max(0.0, min(1.0, cos))
 
 
@@ -183,7 +200,24 @@ class SearchService:
                 s = float(scores[vi_row, j])
                 if s > best.get(img_id, -2.0):
                     best[img_id] = s
-        return {i: _cosine_to_score(s) for i, s in best.items()}
+        baseline = self._embedding_baseline(qvecs)
+        return {i: _cosine_to_score(s, baseline) for i, s in best.items()}
+
+    def _embedding_baseline(self, qvecs: np.ndarray) -> float:
+        """Sorgunun kütüphanedeki **tipik** benzerlik düzeyi (medyan).
+
+        Motorun tuttuğu temsilî örnekleme karşı hesaplanır. TTA varyantları
+        adaylarda olduğu gibi burada da maksimumla birleştirilir; aksi hâlde
+        taban sistematik olarak düşük çıkar ve kalibrasyon şişer.
+
+        Kütüphane çok küçükse (örneklem yoksa) 0 döner — kalibrasyon uygulanmaz.
+        """
+        sample = self.engine.baseline_vectors
+        if sample is None or len(sample) == 0:
+            return 0.0
+        q = self.engine.vector_index.normalize(qvecs)  # (V, dim)
+        per_item = np.max(q @ sample.T, axis=0)        # (N,) varyantlar arası en iyi
+        return float(np.median(per_item))
 
     # -- hibrit ------------------------------------------------------------- #
     def _search_hybrid(self, rgb: np.ndarray, k: int) -> dict[int, float]:
@@ -194,6 +228,7 @@ class SearchService:
         embedder = self.engine.get_embedder()
         variants = _tta_variants(rgb) if self.config.tta else [rgb]
         qv = self.engine.vector_index.normalize(embedder.embed_batch(variants))  # (V, dim)
+        baseline = self._embedding_baseline(qv)
         # Yalnızca hash adaylarını embedding ile yeniden sırala (ucuz).
         result: dict[int, float] = {}
         for img_id, hash_score in hash_hits.items():
@@ -206,7 +241,7 @@ class SearchService:
             cand = np.frombuffer(cur["vec"], dtype=np.float32).copy()
             cand /= (np.linalg.norm(cand) + 1e-9)
             sim = float(np.max(qv @ cand))  # varyantlar arası en iyi kosinüs
-            result[img_id] = _cosine_to_score(sim)
+            result[img_id] = _cosine_to_score(sim, baseline)
         return result
 
     # -- ortak son işleme --------------------------------------------------- #

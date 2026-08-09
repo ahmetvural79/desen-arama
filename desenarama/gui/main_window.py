@@ -12,16 +12,17 @@ import os
 from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap, QKeySequence
 from PySide6.QtWidgets import (
-    QComboBox, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QSpinBox, QVBoxLayout, QWidget, QToolBar, QStatusBar,
+    QApplication, QComboBox, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QProgressDialog, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QToolBar, QStatusBar,
 )
 
 from .. import __app_name__, __version__, config as cfg_mod
 from ..core import formats, osutil, paths
 from ..services.engine import Engine
 from .settings_dialog import SettingsDialog
-from .workers import IndexWorker, SearchWorker, run_in_thread
+from .workers import IndexWorker, ModelDownloadWorker, SearchWorker, run_in_thread
 
 THUMB_ICON = 190
 
@@ -246,11 +247,82 @@ class MainWindow(QMainWindow):
         self.config.save()
         # AI/hibrit moduna geçildiyse ve vektör yoksa kullanıcıyı uyar
         if self.config.uses_embedding():
+            if not self.engine.model_available() and not self._offer_model_download():
+                return
             self.engine.open()  # vektör indeksini yüklemeyi dene
             if self.engine.store.count_vectors() == 0 and self.engine.store.count("ok") > 0:
                 self.status_label.setText(
                     "AI modu seçildi — 'İndeksle / Güncelle' ile embedding'leri üretin."
                 )
+
+    # -- AI modeli ---------------------------------------------------------- #
+    def _offer_model_download(self) -> bool:
+        """AI modeli eksikse indirmeyi önerir; hazır olduğunda ``True`` döner.
+
+        v1.0 modeli bulamadığında sessizce çok daha zayıf bir yedek çıkarıcıya
+        düşüyordu ve kullanıcı bunu asla öğrenmiyordu. Artık durum açıkça
+        gösterilir ve seçim kullanıcıya bırakılır.
+        """
+        spec = self.engine.model_spec()
+        mb = spec.size_bytes / (1024 * 1024)
+        answer = QMessageBox.question(
+            self, "AI modeli gerekli",
+            f"'{spec.note}' modeli bilgisayarınızda yok.\n\n"
+            f"Bir kez indirilmesi gerekiyor (~{mb:.0f} MB). İndirilsin mi?\n\n"
+            "Hayır derseniz arama yöntemi 'Hızlı (hash)' olarak kalır.\n"
+            f"Çevrimdışı kurulum için dosyayı şu klasöre kopyalayabilirsiniz:\n"
+            f"{paths.models_dir()}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            self._revert_to_hash_backend()
+            return False
+        return self._download_model(spec)
+
+    def _download_model(self, spec) -> bool:
+        dialog = QProgressDialog("AI modeli indiriliyor…", "İptal", 0, 100, self)
+        dialog.setWindowTitle("Model indiriliyor")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+
+        worker = ModelDownloadWorker(spec)
+        outcome: dict = {}
+
+        def on_progress(done: int, total: int) -> None:
+            if total:
+                dialog.setValue(int(done * 100 / total))
+                dialog.setLabelText(
+                    f"AI modeli indiriliyor… {done / 1048576:.0f} / {total / 1048576:.0f} MB"
+                )
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(lambda path: outcome.update(ok=True))
+        worker.failed.connect(lambda msg: outcome.update(ok=False, error=msg))
+        dialog.canceled.connect(worker.cancel)
+
+        thread, _ = run_in_thread(worker)
+        self._threads.append((thread, worker))
+        # İndirme bitene kadar olay döngüsünü çevir; pencere yanıt vermeye devam eder.
+        while not outcome:
+            QApplication.processEvents()
+        dialog.close()
+
+        if outcome.get("ok"):
+            self.status_label.setText("AI modeli hazır.")
+            return True
+        QMessageBox.warning(self, "Model indirilemedi", outcome.get("error", "Bilinmeyen hata"))
+        self._revert_to_hash_backend()
+        return False
+
+    def _revert_to_hash_backend(self) -> None:
+        """AI kullanılamıyorsa hızlı moda dön — sessizce bozuk sonuç üretme."""
+        self.config.backend = cfg_mod.BACKEND_HASH
+        self.config.save()
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setCurrentIndex(0)
+        self.backend_combo.blockSignals(False)
+        self.status_label.setText("Arama yöntemi 'Hızlı (hash)' olarak ayarlandı.")
 
     def _on_tta_changed(self, checked: bool) -> None:
         self.config.tta = checked
@@ -281,6 +353,11 @@ class MainWindow(QMainWindow):
         if not self.config.library_roots:
             QMessageBox.warning(self, "Kütüphane yok", "Önce bir kütüphane klasörü ekleyin.")
             return
+        # AI modunda indeksleme model olmadan çalışamaz; uzun bir taramanın
+        # ortasında değil, başlamadan önce hallet.
+        if self.config.uses_embedding() and not self.engine.model_available():
+            if not self._offer_model_download():
+                return
         self.index_action.setEnabled(False)
         self.cancel_action.setEnabled(True)
         self.progress.setVisible(True)

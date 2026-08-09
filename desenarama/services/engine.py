@@ -23,6 +23,14 @@ from ..core import hasher, hashindex, models, paths, store, vindex
 # Kütüphane bu eşiği aşarsa FAISS Flat yerine HNSW (yaklaşık) indekse geçilir.
 HNSW_THRESHOLD = 200_000
 
+#: Skor kalibrasyonu için saklanan örneklem büyüklüğü. 2048 × 768 float32
+#: ≈ 6 MB; medyan tahmini için fazlasıyla yeter.
+BASELINE_SAMPLE_SIZE = 2048
+
+#: Bu sayının altındaki kütüphanelerde örneklem medyanı güvenilir değildir;
+#: kalibrasyon uygulanmaz.
+BASELINE_MIN_VECTORS = 32
+
 log = logging.getLogger("desenarama.engine")
 
 _HASH_COL = {"phash": "phash", "dhash": "dhash", "ahash": "ahash", "whash": "whash"}
@@ -35,6 +43,9 @@ class Engine:
         self.hash_index: hashindex.HashIndex | None = None
         self.vector_index: vindex.VectorIndex | None = None
         self.row_to_id: dict[int, int] = {}
+        #: Skor kalibrasyonu için kütüphaneden alınan temsilî vektör örneklemi
+        #: (normalize, en fazla :data:`BASELINE_SAMPLE_SIZE` satır).
+        self.baseline_vectors: np.ndarray | None = None
         self._embedder = None
 
     # -- yollar ------------------------------------------------------------- #
@@ -71,8 +82,14 @@ class Engine:
         if not dim or self.store.count_vectors() == 0:
             self.vector_index = None
             self.row_to_id = {}
+            self.baseline_vectors = None
             return
         n = self.store.count_vectors()
+        # Kalibrasyon örneklemi: kütüphane boyunca eşit aralıklarla seç.
+        # Rastgele yerine adımlı seçim, tarama sırasının (klasör/tarih) yarattığı
+        # kümelenmeye karşı daha temsilî ve tekrarlanabilirdir.
+        sample_step = max(1, n // BASELINE_SAMPLE_SIZE)
+        sample: list[np.ndarray] = []
         use_hnsw = n > HNSW_THRESHOLD
         index = vindex.VectorIndex(dim, hnsw=use_hnsw)
         row_to_id: dict[int, int] = {}
@@ -87,14 +104,21 @@ class Engine:
                 batch.clear()
                 ids.clear()
 
-        for image_id, blob in self.store.iter_vectors():
-            batch.append(np.frombuffer(blob, dtype=np.float32).copy())
+        for pos, (image_id, blob) in enumerate(self.store.iter_vectors()):
+            vec = np.frombuffer(blob, dtype=np.float32).copy()
+            batch.append(vec)
             ids.append(image_id)
+            if pos % sample_step == 0 and len(sample) < BASELINE_SAMPLE_SIZE:
+                sample.append(vec)
             if len(batch) >= 4096:
                 flush()
         flush()
         self.vector_index = index
         self.row_to_id = row_to_id
+        self.baseline_vectors = (
+            vindex.VectorIndex.normalize(np.stack(sample))
+            if len(sample) >= BASELINE_MIN_VECTORS else None
+        )
         try:
             index.save(self.faiss_path)
         except Exception as e:  # disk dolu vb. — indeks bellekte yine çalışır
@@ -108,13 +132,27 @@ class Engine:
             self._load_vector_index()
 
     # -- embedder (tembel) -------------------------------------------------- #
-    def get_embedder(self, allow_download: bool = True, progress=None):
+    def model_spec(self):
+        return models.resolve(self.config.model_key)
+
+    def model_available(self) -> bool:
+        """Seçili AI modeli yerelde hazır mı? (indirme denemeden)"""
+        return models.is_available(self.model_spec())
+
+    def get_embedder(self, allow_download: bool = True, progress=None,
+                     allow_fallback: bool = False):
+        """Embedder'ı (tembel) yükler.
+
+        Model yoksa ve indirilemiyorsa :class:`EmbedderUnavailable` yükselir —
+        v1.0'daki gibi sessizce zayıf bir yedeğe düşülmez; çağıran katman
+        durumu kullanıcıya bildirmekle yükümlüdür.
+        """
         if self._embedder is not None:
             return self._embedder
         from ..core import embedder as emb_mod
 
         model_path = None
-        spec = models.resolve(self.config.model_key)
+        spec = self.model_spec()
         if models.is_available(spec):
             model_path = models.local_path(spec)
         elif allow_download:
@@ -122,9 +160,12 @@ class Engine:
                 model_path = models.download(spec, progress=progress)
             except Exception as e:
                 log.warning("Model indirilemedi: %s", e)
-                model_path = None
+                if not allow_fallback:
+                    raise emb_mod.EmbedderUnavailable(str(e)) from e
+
         self._embedder = emb_mod.load_embedder(
-            model_path, prefer_gpu=self.config.prefer_gpu
+            model_path, prefer_gpu=self.config.prefer_gpu,
+            allow_fallback=allow_fallback,
         )
         self.store.set_meta("embedder_name", self._embedder.name)
         self.store.set_meta("embed_dim", str(self._embedder.dim))

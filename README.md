@@ -31,8 +31,14 @@ Ortak kalite hileleri her yöntemde geçerlidir:
   hit@1'i 0.04 → 0.50'ye çıkardı.)
 - **Kalibre skorlar:** benzerlik `0` = alakasız, `1` = birebir. Algısal hash'lerde
   alakasız iki görselin bitlerinin yaklaşık yarısı farklıdır; skor bu tabana göre
-  ölçeklenir, böylece "%50 benzer" görünen alakasız sonuçlar oluşmaz. Her sonuç
-  ayrıca bir kalite bandıyla (Kopya / Çok benzer / Benzer / Zayıf) etiketlenir.
+  ölçeklenir, böylece "%50 benzer" görünen alakasız sonuçlar oluşmaz. AI modunda
+  taban **kütüphaneden** öğrenilir: hepsi halı olan bir arşivde DINOv2 alakasız
+  iki deseni bile ~0.88 kosinüsle eşler, bu yüzden skor koleksiyonun kendi
+  medyanına göre yeniden ölçeklenir. Her sonuç ayrıca bir kalite bandıyla
+  (Kopya / Çok benzer / Benzer / Zayıf) etiketlenir.
+- **Model şeffaflığı:** AI modeli yoksa uygulama sessizce zayıf bir yedeğe
+  düşmez — durumu bildirir, indirmeyi (ilerleme + iptal) önerir ve
+  reddedilirse hızlı moda döner. İndirilen dosya SHA256 ile doğrulanır.
 - **Renk re-ranking:** "Renk önemi" slider'ıyla `final = desen · (1-α + α·renk)`.
   Desen kapıdır; renk en fazla α oranında düzeltme yapar ve deseni eşleşmeyen bir
   sonucu asla yukarı taşıyamaz. **Varsayılan α = 0**, çünkü halı arşivinde "aynı

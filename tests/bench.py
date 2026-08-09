@@ -105,10 +105,19 @@ def main():
     rows.append(("hash", "açık", run_config(args.dataset, "hash", True)))
 
     if not args.skip_embedding:
-        print("Embedding (TTA kapalı) ...")
-        rows.append(("embedding", "kapalı", run_config(args.dataset, "embedding", False)))
-        print("Embedding (TTA açık) ...")
-        rows.append(("embedding", "açık", run_config(args.dataset, "embedding", True)))
+        # Model yoksa ölçüm yapma: v1.0'da bu durumda sessizce zayıf yedek
+        # çıkarıcı kullanılıyor ve "embedding" satırı DINOv2 sanılıyordu.
+        from desenarama.core import models
+
+        spec = models.resolve(cfg_mod.AppConfig().model_key)
+        if not models.is_available(spec):
+            print(f"AI modeli yok ({models.local_path(spec)}) — embedding ölçümü "
+                  f"atlanıyor. Modeli indirin veya --skip-embedding kullanın.")
+        else:
+            print("Embedding (TTA kapalı) ...")
+            rows.append(("embedding", "kapalı", run_config(args.dataset, "embedding", False)))
+            print("Embedding (TTA açık) ...")
+            rows.append(("embedding", "açık", run_config(args.dataset, "embedding", True)))
 
     # Markdown tablo
     lines = ["# Benchmark — Recall@k", "",

@@ -164,8 +164,8 @@ geometri görüyor, karşılaştırmalar tutarsız.
 
 ## 4. Geliştirme planı
 
-> **Durum (9 Ağustos 2026):** Faz A ve Faz B tamamlandı ve testlerle sabitlendi.
-> Faz C ve D bekliyor.
+> **Durum (9 Ağustos 2026):** Faz A, B ve C tamamlandı ve testlerle sabitlendi.
+> Faz D bekliyor.
 
 ### Faz A — BMP ve format kapsaması ✅ TAMAMLANDI
 
@@ -211,7 +211,33 @@ Faz D.5'e bırakıldı.
 5. Regresyon testi: Bölüm 3.2'deki 5 senaryo sabit fikstür olarak repoya girsin;
    "farklı desen, kırpılmış aynı desenden düşük skor almalı" testi CI'da koşsun.
 
-### Faz C — AI arka ucunu gerçekten çalışır hâle getir (2–3 gün, orta risk)
+### Faz C — AI arka ucunu gerçekten çalışır hâle getir ✅ TAMAMLANDI
+
+Gerçek model indirilip ölçüldü; iki karar veriye dayandırıldı:
+
+* **Letterbox ön işleme alındı** — kırpılmış sorguda aynı desenin kosinüsü
+  0.867 → 0.918'e çıktı, alakasız desen yerinde kaldı (ayrım payı ~7×).
+* **CLS + yama-ortalaması birleştirmesi alınmadı** — denendi, alakasız deseni
+  0.888'den 0.907'ye çıkararak ayrımı *kötüleştirdi*. Yalnızca CLS kullanılıyor.
+
+Planda olmayan üçüncü bir arıza bulundu ve düzeltildi: **DINOv2 kosinüsleri dar
+ve yüksek bir bantta yaşıyor.** 124 görsellik halı arşivinde ölçülen değerler —
+kütüphane medyanı 0.878, alakasız medyan 0.877, aynı desen farklı renk 0.950,
+birebir 1.000. Sabit ölçekle bunlar 0.94–1.00 aralığına sıkışıyor, yani AI
+modunda da "her şey %95 benzer" görünüyordu. Skor artık kütüphaneden alınan
+temsilî örneklemin medyanına göre yeniden ölçekleniyor:
+
+| | ham kosinüs | eski ölçek | yeni kalibre |
+|---|---|---|---|
+| Birebir / döndürülmüş | 1.000 | 1.000 | 1.000 |
+| Aynı desen, farklı renk | 0.950 | 0.975 | 0.593 |
+| Aynı desen, kırpılmış | 0.925 | 0.962 | 0.384 |
+| Alakasız (medyan) | 0.877 | 0.939 | **0.000** |
+
+Uyarı: bu ölçümdeki "alakasız" örnekler tek bir üreteçten geldiği ve hepsi aynı
+bordürü taşıdığı için gerçekte olacaklarından benzerdir; en yüksek alakasız
+komşu 0.663 alıyor. Mutlak sayılar gerçek arşivde daha iyi olmalıdır ama bunu
+doğrulamak Faz D.5'teki etiketli seti gerektirir.
 
 1. **Bozuk `dinov2-base` URL'ini değiştir** → `onnx-community/dinov2-base`
    (`onnx/model.onnx`). `dinov2-small` için de `onnx-community/dinov2-small`
