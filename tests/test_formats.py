@@ -65,7 +65,7 @@ def test_bmp_is_indexed_by_default(tmp_path):
 
 
 def test_scanner_ignores_unsupported_extension(tmp_path):
-    (tmp_path / "notlar.txt").write_text("desen değil")
+    (tmp_path / "notlar.txt").write_text("desen değil", encoding="utf-8")
     assert list(scanner.iter_images(str(tmp_path))) == []
 
 
