@@ -126,6 +126,14 @@ def _tta_variants(rgb: np.ndarray) -> list[np.ndarray]:
     return out
 
 
+def _center_crop(rgb: np.ndarray, fraction: float = 0.5) -> np.ndarray:
+    """Görselin merkezinden ``fraction`` oranında bir kare kırpar."""
+    h, w = rgb.shape[0], rgb.shape[1]
+    ch, cw = max(1, int(h * fraction)), max(1, int(w * fraction))
+    y0, x0 = (h - ch) // 2, (w - cw) // 2
+    return np.ascontiguousarray(rgb[y0:y0 + ch, x0:x0 + cw])
+
+
 class SearchService:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
@@ -156,6 +164,30 @@ class SearchService:
 
         return self._finalize(query_rgb, hits, alpha, k)
 
+    # -- sorgu görünümleri -------------------------------------------------- #
+    def _hash_views(self, rgb: np.ndarray) -> list[np.ndarray]:
+        """Hash araması için sorgu varyantları — yalnızca döndürme/ayna.
+
+        Hash bir *yakın kopya* aracıdır; kırpma varyantları eklemek recall'dan
+        çok gürültü getirir (kırpılmış hash zaten tamamen farklı bir hash'tir).
+        """
+        return _tta_variants(rgb) if self.config.tta else [rgb]
+
+    def _embedding_views(self, rgb: np.ndarray) -> list[np.ndarray]:
+        """Embedding araması için sorgu varyantları — döndürme + çok ölçeklilik.
+
+        Sorgunun tamamına ek olarak merkez %50 kırpması da aranır: kütüphanedeki
+        görsel sorgunun bir *yakın çekimi* olduğunda eşleşmeyi sağlar. Yalnızca
+        sorgu maliyetidir, indeks büyümez. Ters yön (sorgu kütüphane görselinin
+        parçası) indeks tarafındaki karolarla çözülür (bkz. ``tile_grid``).
+        """
+        views = [rgb]
+        if self.config.query_multiscale:
+            views.append(_center_crop(rgb))
+        if not self.config.tta:
+            return views
+        return [v for view in views for v in _tta_variants(view)]
+
     # -- hash arka ucu ------------------------------------------------------ #
     def _search_hash(self, rgb: np.ndarray, k: int) -> dict[int, float]:
         """{image_id: pattern_score(0..1)} — en iyi (varyant içi) benzerlik."""
@@ -164,7 +196,7 @@ class SearchService:
             return {}
         hs = self.config.hash_size
         algo = self.config.hash_algo
-        variants = _tta_variants(rgb) if self.config.tta else [rgb]
+        variants = self._hash_views(rgb)
         # Eşik 64-bit referansıyla saklanır; seçili hash boyutuna ölçeklenir.
         max_dist = self.config.effective_max_distance()
         best: dict[int, float] = {}
@@ -184,9 +216,12 @@ class SearchService:
         if vi is None or vi.ntotal == 0:
             return {}
         embedder = self.engine.get_embedder()
-        variants = _tta_variants(rgb) if self.config.tta else [rgb]
+        variants = self._embedding_views(rgb)
         qvecs = embedder.embed_batch(variants)  # (V, dim)
-        cand_k = max(self.config.rerank_candidates, k)
+        # Karo indekslemede aynı imaj birden çok satır kaplar; aday sayısını
+        # karo başına ölçekle, aksi hâlde top-k'yı tek bir imajın karoları
+        # doldurabilir.
+        cand_k = max(self.config.rerank_candidates, k) * max(1, self.engine.tiles_per_image())
         scores, ids = vi.search(qvecs, cand_k)  # (V, cand_k)
         best: dict[int, float] = {}
         for vi_row in range(scores.shape[0]):
@@ -221,27 +256,47 @@ class SearchService:
 
     # -- hibrit ------------------------------------------------------------- #
     def _search_hybrid(self, rgb: np.ndarray, k: int) -> dict[int, float]:
-        """Hash ile ucuz aday üret; adayları embedding ile yeniden sırala."""
+        """Hash **ve** embedding adaylarını birleştirip embedding ile sırala.
+
+        Önceki sürümde adaylar yalnızca hash'ten geliyordu; bu, hibridin
+        recall'ını hash'in recall'ıyla sınırlıyordu — hash kaçırdığında (farklı
+        renk, kısmi eşleşme) embedding'in kurtarma şansı yoktu. Artık iki aday
+        havuzu birleştirilir: hash ucuz ve kesin, embedding geniş ve derin.
+        """
         hash_hits = self._search_hash(rgb, max(k * 5, 200))
-        if not self.engine.vector_index or not hash_hits:
+        if not self.engine.vector_index:
             return hash_hits
-        embedder = self.engine.get_embedder()
-        variants = _tta_variants(rgb) if self.config.tta else [rgb]
-        qv = self.engine.vector_index.normalize(embedder.embed_batch(variants))  # (V, dim)
-        baseline = self._embedding_baseline(qv)
-        # Yalnızca hash adaylarını embedding ile yeniden sırala (ucuz).
-        result: dict[int, float] = {}
-        for img_id, hash_score in hash_hits.items():
-            cur = self.engine.store._conn.execute(
-                "SELECT vec FROM vectors WHERE image_id=?", (img_id,)
-            ).fetchone()
-            if cur is None:
-                result[img_id] = hash_score  # embedding yoksa hash skoruyla bırak
-                continue
-            cand = np.frombuffer(cur["vec"], dtype=np.float32).copy()
-            cand /= (np.linalg.norm(cand) + 1e-9)
-            sim = float(np.max(qv @ cand))  # varyantlar arası en iyi kosinüs
-            result[img_id] = _cosine_to_score(sim, baseline)
+
+        embed_hits = self._search_embedding(rgb, k)
+        if not hash_hits and not embed_hits:
+            return {}
+
+        # İki skorun **maksimumu** alınır, embedding'inki tek başına değil.
+        # Ölçümde iki yöntemin güçlü olduğu senaryolar farklı çıktı: hash
+        # colorway varyantlarında belirgin biçimde daha iyi (recall@10 0.65 vs
+        # 0.25 — gri tonlama üzerinden çalıştığı için renk değişimine dayanıklı),
+        # karo destekli embedding ise kırpılmış sorgularda tek çalışan yöntem
+        # (0.40 vs 0.00). Embedding skorunu üste yazmak hash'in colorway
+        # üstünlüğünü çöpe atıyordu; maksimum ikisini de korur.
+        result = {i: max(s, hash_hits.get(i, 0.0)) for i, s in embed_hits.items()}
+        missing = [i for i in hash_hits if i not in result]
+        if missing:
+            embedder = self.engine.get_embedder()
+            qv = self.engine.vector_index.normalize(
+                embedder.embed_batch(self._embedding_views(rgb)))
+            baseline = self._embedding_baseline(qv)
+            vectors = self.engine.store.get_vectors_for(missing)  # tek sorgu
+            for img_id in missing:
+                blobs = vectors.get(img_id)
+                if not blobs:
+                    # Embedding'i olmayan kayıt: hash skoruyla bırak.
+                    result[img_id] = hash_hits[img_id]
+                    continue
+                cand = np.stack([np.frombuffer(b, dtype=np.float32) for b in blobs])
+                cand = self.engine.vector_index.normalize(cand)
+                # Sorgu varyantları × aday karoları arasındaki en iyi eşleşme.
+                embed_score = _cosine_to_score(float(np.max(qv @ cand.T)), baseline)
+                result[img_id] = max(embed_score, hash_hits[img_id])
         return result
 
     # -- ortak son işleme --------------------------------------------------- #

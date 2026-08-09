@@ -17,9 +17,18 @@ import threading
 import time
 from dataclasses import dataclass
 
+import logging
+
 from . import paths
 
-SCHEMA_VERSION = 1
+log = logging.getLogger("desenarama.store")
+
+#: 1 → 2: ``vectors`` tablosu imaj başına tek vektör yerine **karo** (tile)
+#: taşıyor. Vektörler türetilmiş veridir; şema atlarken yeniden üretilirler.
+SCHEMA_VERSION = 2
+
+#: Tam kareyi (karo bölmesi olmayan) temsil eden karo numarası.
+WHOLE_IMAGE_TILE = 0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS images(
@@ -44,9 +53,12 @@ CREATE TABLE IF NOT EXISTS images(
 CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
 CREATE INDEX IF NOT EXISTS idx_images_vecrow ON images(vec_row);
 CREATE TABLE IF NOT EXISTS vectors(
-    image_id INTEGER PRIMARY KEY,
-    vec      BLOB NOT NULL
+    image_id INTEGER NOT NULL,
+    tile     INTEGER NOT NULL DEFAULT 0,   -- 0 = tam kare, 1..N = karo
+    vec      BLOB NOT NULL,
+    PRIMARY KEY(image_id, tile)
 );
+CREATE INDEX IF NOT EXISTS idx_vectors_image ON vectors(image_id);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
@@ -85,9 +97,30 @@ class ImageStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._migrate_schema()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self.set_meta("schema_version", str(SCHEMA_VERSION))
+
+    def _migrate_schema(self) -> None:
+        """Eski şemaları güncel sürüme taşır.
+
+        Vektörler **türetilmiş** veridir (kaynak görsellerden yeniden
+        üretilebilir), bu yüzden şema atlarken tablo düşürülür ve embedding'ler
+        yeniden hesaplanır. Metadata (yol, hash, thumbnail) korunur — asıl
+        pahalı olan tarama tekrarlanmaz.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        except sqlite3.OperationalError:
+            return  # meta tablosu yok => yeni veritabanı
+        version = int(row["value"]) if row else 0
+        if 0 < version < 2:
+            log.info("Şema %d -> %d: vektör tablosu karo desteğiyle yeniden kuruluyor "
+                     "(embedding'ler yeniden hesaplanacak).", version, SCHEMA_VERSION)
+            self._conn.execute("DROP TABLE IF EXISTS vectors")
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -178,36 +211,75 @@ class ImageStore:
             self._conn.commit()
 
     # -- vektörler ---------------------------------------------------------- #
-    def upsert_vector(self, image_id: int, vec: bytes) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO vectors(image_id, vec) VALUES(?, ?) "
-                "ON CONFLICT(image_id) DO UPDATE SET vec=excluded.vec",
-                (image_id, vec),
-            )
-            self._conn.commit()
+    def upsert_vector(self, image_id: int, vec: bytes,
+                      tile: int = WHOLE_IMAGE_TILE) -> None:
+        self.upsert_vectors([(image_id, tile, vec)])
 
-    def upsert_vectors(self, items: list[tuple[int, bytes]]) -> None:
-        """Toplu vektör yazımı (batch indeksleme için tek commit)."""
+    def upsert_vectors(self, items: list[tuple[int, int, bytes]]) -> None:
+        """Toplu vektör yazımı — ``(image_id, tile, vec)`` (tek commit).
+
+        Aynı imaj için önceki karolar **silinir**: karo ızgarası ayarlardan
+        değiştiğinde eski karoların ortada kalması (orphan) engellenir.
+        """
+        if not items:
+            return
+        image_ids = {i for i, _, _ in items}
         with self._lock:
             self._conn.executemany(
-                "INSERT INTO vectors(image_id, vec) VALUES(?, ?) "
-                "ON CONFLICT(image_id) DO UPDATE SET vec=excluded.vec",
+                "DELETE FROM vectors WHERE image_id=?", [(i,) for i in image_ids]
+            )
+            self._conn.executemany(
+                "INSERT INTO vectors(image_id, tile, vec) VALUES(?, ?, ?) "
+                "ON CONFLICT(image_id, tile) DO UPDATE SET vec=excluded.vec",
                 items,
             )
             self._conn.commit()
 
     def iter_vectors(self):
-        """Durumu 'ok' olan imajların (image_id, vec_blob) çiftlerini id sırasıyla verir."""
+        """Durumu 'ok' olan imajların (image_id, tile, vec_blob) üçlülerini verir."""
         sql = (
-            "SELECT v.image_id AS image_id, v.vec AS vec FROM vectors v "
-            "JOIN images i ON i.id = v.image_id WHERE i.status='ok' ORDER BY v.image_id"
+            "SELECT v.image_id AS image_id, v.tile AS tile, v.vec AS vec FROM vectors v "
+            "JOIN images i ON i.id = v.image_id WHERE i.status='ok' "
+            "ORDER BY v.image_id, v.tile"
         )
         for row in self._conn.execute(sql):
-            yield row["image_id"], row["vec"]
+            yield row["image_id"], row["tile"], row["vec"]
+
+    def get_vectors_for(self, image_ids) -> dict[int, list[bytes]]:
+        """Verilen imajların tüm karo vektörlerini **tek sorguda** getirir.
+
+        Hibrit yeniden sıralama önceden aday başına ayrı bir sorgu açıyordu
+        (200 aday = 200 sorgu) ve bunu servis katmanından ``store._conn``
+        özel alanına erişerek yapıyordu.
+        """
+        ids = list(image_ids)
+        if not ids:
+            return {}
+        out: dict[int, list[bytes]] = {}
+        # SQLite değişken sınırına (varsayılan 999) karşı parçalayarak sor.
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            sql = (f"SELECT image_id, vec FROM vectors "
+                   f"WHERE image_id IN ({placeholders}) ORDER BY image_id, tile")
+            for row in self._conn.execute(sql, chunk):
+                out.setdefault(row["image_id"], []).append(row["vec"])
+        return out
+
+    def clear_vectors(self) -> None:
+        """Tüm embedding'leri siler (model/ön işleme değiştiğinde geçersizleşirler)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM vectors")
+            self._conn.commit()
 
     def count_vectors(self) -> int:
+        """Toplam **karo** sayısı (FAISS satır sayısına karşılık gelir)."""
         cur = self._conn.execute("SELECT COUNT(*) c FROM vectors")
+        return int(cur.fetchone()["c"])
+
+    def count_vector_images(self) -> int:
+        """Embedding'i olan **imaj** sayısı (karo sayısından bağımsız)."""
+        cur = self._conn.execute("SELECT COUNT(DISTINCT image_id) c FROM vectors")
         return int(cur.fetchone()["c"])
 
     def keys_missing_vectors(self) -> list[tuple[str, str, float, int]]:

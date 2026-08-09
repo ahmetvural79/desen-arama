@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..core import colorhist, hasher, imageio, paths, scanner, store
+from ..core import colorhist, embedder as emb_mod, hasher, imageio, paths, scanner, store
 from ..core.imageio import ImageLoadError
 from .engine import Engine
 
@@ -129,6 +129,8 @@ class IndexerService:
             # Vektör boyutunu kaydet — motorun FAISS'i yeniden kurabilmesi için şart.
             self.store.set_meta("embed_dim", str(embedder.dim))
             self.store.set_meta("embedder_name", embedder.name)
+            to_process = self._invalidate_stale_vectors(embedder, to_process)
+            prog.total = len(to_process)
         batch_size = max(8, self.config.cpu_batch)
         io_workers = max(1, self.config.io_workers)
 
@@ -140,14 +142,25 @@ class IndexerService:
                 self._wait_if_paused()
                 processed = list(pool.map(lambda e: self._process_one(e, keep_rgb=use_embed), chunk))
 
-                # 3a) embedding batch (AI modu) — kimlik (id) tabanlı eşleme
-                vec_items: list[tuple[int, bytes]] = []
-                vec_for: dict[int, bytes] = {}
+                # 3a) embedding batch (AI modu) — kimlik (id) tabanlı eşleme.
+                # Karo indeksleme açıksa her görsel için tam kare + grid×grid
+                # karo gömülür; hepsi tek batch'te çıkarılır ve görsel başına
+                # geri gruplanır.
+                vec_items: list[tuple[int, int, bytes]] = []
+                vec_for: dict[int, list[bytes]] = {}
                 good = [p for p in processed if p.error is None]
                 if use_embed and good:
-                    vecs = embedder.embed_batch([p.rgb for p in good])
-                    for p, v in zip(good, vecs):
-                        vec_for[id(p)] = np.ascontiguousarray(v, dtype=np.float32).tobytes()
+                    grid = self.config.tile_grid
+                    per_image = [emb_mod.tiles(p.rgb, grid) for p in good]
+                    flat = [crop for crops in per_image for crop in crops]
+                    vecs = embedder.embed_batch(flat)
+                    pos = 0
+                    for p, crops in zip(good, per_image):
+                        vec_for[id(p)] = [
+                            np.ascontiguousarray(vecs[pos + i], dtype=np.float32).tobytes()
+                            for i in range(len(crops))
+                        ]
+                        pos += len(crops)
 
                 # 3b) DB yazımı
                 for p in processed:
@@ -168,7 +181,10 @@ class IndexerService:
                             error=None, indexed_at=store.now(),
                         )
                         if use_embed and id(p) in vec_for:
-                            vec_items.append((img_id, vec_for[id(p)]))
+                            vec_items.extend(
+                                (img_id, tile_no, blob)
+                                for tile_no, blob in enumerate(vec_for[id(p)])
+                            )
                     prog.done += 1
                     prog.current = p.entry.path
 
@@ -194,6 +210,41 @@ class IndexerService:
         log.info("İndeksleme bitti: %d işlendi, %d hata, %.1f sn (%.1f imaj/sn)",
                  prog.done, prog.errors, prog.elapsed, prog.rate)
         return prog
+
+    # -- embedding geçerliliği ---------------------------------------------- #
+    def _invalidate_stale_vectors(self, embedder, to_process: list) -> list:
+        """Model/ön işleme/karo ayarı değiştiyse eski embedding'leri atar.
+
+        Vektörler yalnızca üretildikleri koşullarda (aynı model, aynı ön işleme,
+        aynı karo ızgarası) karşılaştırılabilir. v1.0'da böyle bir kontrol yoktu;
+        ön işleme değişince eski indeks **sessizce** yanlış sonuç üretiyordu.
+
+        Metadata (yol, hash, thumbnail) korunur — yalnızca embedding'ler
+        yeniden hesaplanır.
+        """
+        from ..core import embedder as emb_mod
+
+        sig = emb_mod.signature(
+            embedder.name, self.config.model_key, embedder.dim, self.config.tile_grid
+        )
+        previous = self.store.get_meta("embed_signature")
+        if previous == sig:
+            return to_process
+
+        if previous is not None and self.store.count_vectors() > 0:
+            log.info("Embedding koşulları değişti (%s -> %s); vektörler yeniden "
+                     "hesaplanacak.", previous, sig)
+            self.store.clear_vectors()
+        self.store.set_meta("embed_signature", sig)
+
+        # Vektörü kalmayan her kayıt yeniden işlenmeli.
+        have = {e.key for e in to_process}
+        extra = [
+            scanner.ScanEntry(path=path, key=key, mtime=mtime, size=size)
+            for key, path, mtime, size in self.store.keys_missing_vectors()
+            if key not in have
+        ]
+        return to_process + extra
 
     # -- tek dosya işleme --------------------------------------------------- #
     def _process_one(self, entry: scanner.ScanEntry, keep_rgb: bool) -> _Processed:

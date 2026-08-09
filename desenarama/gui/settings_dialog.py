@@ -46,9 +46,9 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
 
         self.backend_combo = QComboBox()
-        for label, val in [("Hızlı (hash)", cfg_mod.BACKEND_HASH),
+        for label, val in [("Hızlı (hash) — model gerektirmez", cfg_mod.BACKEND_HASH),
                            ("AI (DINOv2)", cfg_mod.BACKEND_EMBEDDING),
-                           ("Hibrit", cfg_mod.BACKEND_HYBRID)]:
+                           ("Hibrit — önerilen", cfg_mod.BACKEND_HYBRID)]:
             self.backend_combo.addItem(label, val)
         self.backend_combo.setCurrentIndex(
             [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(cfg.backend)
@@ -71,6 +71,25 @@ class SettingsDialog(QDialog):
         self.model_combo.addItem("DINOv2-B (768, kaliteli)", "dinov2-base")
         self.model_combo.setCurrentIndex(0 if cfg.model_key == "dinov2-small" else 1)
         form.addRow("AI modeli:", self.model_combo)
+
+        self.tile_combo = QComboBox()
+        self.tile_combo.addItem("Kapalı — en hızlı indeksleme", 0)
+        self.tile_combo.addItem("2×2 karo — indeksleme ~5× yavaş", 2)
+        self.tile_combo.addItem("3×3 karo — indeksleme ~10× yavaş", 3)
+        self.tile_combo.setCurrentIndex({0: 0, 2: 1, 3: 2}.get(cfg.tile_grid, 0))
+        self.tile_combo.setToolTip(
+            "Sorgunuz çoğunlukla desenin bir parçasıysa (motif fotoğrafı, kısmi\n"
+            "tarama) açın: her görsel karolara bölünüp ayrı ayrı indekslenir.\n"
+            "Değiştirince embedding'ler yeniden hesaplanır."
+        )
+        form.addRow("Kısmi eşleşme (karo indeksleme):", self.tile_combo)
+
+        self.multiscale_check = QCheckBox(
+            "Çok ölçekli sorgu — sorgunun merkez kırpması da aransın")
+        self.multiscale_check.setChecked(cfg.query_multiscale)
+        self.multiscale_check.setToolTip(
+            "Yalnızca sorgu maliyetidir; indeks büyümez.")
+        form.addRow("", self.multiscale_check)
 
         self.gpu_check = QCheckBox("GPU (DirectML/CUDA) kullan — varsa")
         self.gpu_check.setChecked(cfg.prefer_gpu)
@@ -186,6 +205,8 @@ class SettingsDialog(QDialog):
         c.hash_algo = self.hash_algo.currentText()
         c.hash_size = self.hash_size.currentData()
         c.model_key = self.model_combo.currentData()
+        c.tile_grid = self.tile_combo.currentData()
+        c.query_multiscale = self.multiscale_check.isChecked()
         c.prefer_gpu = self.gpu_check.isChecked()
         c.duplicate_hamming = self.dup_spin.value()
         c.hash_max_distance = self.maxdist_spin.value()

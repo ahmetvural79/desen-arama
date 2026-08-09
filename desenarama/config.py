@@ -53,6 +53,21 @@ class AppConfig:
     prefer_gpu: bool = False          # DirectML/CUDA varsa kullan
     tta: bool = True                  # döndürme dayanıklılığı (8x test-time augmentation)
 
+    # Karo (tile) indeksleme: her görsel için tam kare + grid×grid karo gömülür,
+    # sorguda karolar arası maksimum benzerlik alınır. Sorgu, kütüphanedeki bir
+    # görselin **parçası** olduğunda (motif fotoğrafı, kısmi tarama) çalışan tek
+    # yöntemdir.
+    #
+    # Varsayılan 0 = kapalı: 3×3 ızgara indeksleme süresini ve embedding
+    # depolamasını ~10 katına çıkarır. Sorgularınız çoğunlukla kısmi görsellerse
+    # Ayarlar'dan 2 (5×) veya 3 (10×) yapın.
+    tile_grid: int = 0
+
+    # Sorgu tarafında çok ölçeklilik: sorgunun tamamına ek olarak merkez %50
+    # kırpması da aranır. Yalnızca sorgu maliyetidir (indeks büyümez), bu yüzden
+    # varsayılan açıktır.
+    query_multiscale: bool = True
+
     # -- yeniden sıralama -- #
     # 0 = yalnızca desen; artan değerler renk uyuşmazlığını cezalandırır
     # (çarpımsal, bkz. services.search._blend).

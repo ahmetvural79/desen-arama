@@ -34,6 +34,17 @@ def family_of(name: str) -> str:
     return os.path.basename(name).split("_")[0]
 
 
+def scenario_of(name: str) -> str:
+    """Sorgu senaryosu — "fam3_recolor.png" -> "recolor".
+
+    Senaryo kırılımı şart: toplam Recall@10 tek bir sayıya indirgendiğinde
+    "kırpılmış sorgular tamamen çalışmıyor" gibi bir arıza, diğer senaryoların
+    yüksek skorları arasında görünmez hâle gelir.
+    """
+    stem = os.path.splitext(os.path.basename(name))[0]
+    return stem.split("_", 1)[1] if "_" in stem else "?"
+
+
 def evaluate(engine, files, ks=(1, 3, 5, 10)):
     svc = SearchService(engine)
     hit = {k: 0 for k in ks}
@@ -43,34 +54,47 @@ def evaluate(engine, files, ks=(1, 3, 5, 10)):
     for f in files:
         fam_counts[family_of(f)] = fam_counts.get(family_of(f), 0) + 1
 
+    per_scenario: dict[str, dict] = {}
+
     t0 = time.time()
     for f in files:
         fam = family_of(f)
+        scen = scenario_of(f)
         results = svc.search(query_path=f, k=max(ks) + 1)
         # kendini çıkar
         others = [r for r in results if os.path.abspath(r.path) != os.path.abspath(f)]
         names = [os.path.basename(r.path) for r in others]
+        denom = max(fam_counts[fam] - 1, 1)
+        bucket = per_scenario.setdefault(scen, {"n": 0, "hit10": 0, "recall10": 0.0})
+        bucket["n"] += 1
         for k in ks:
             topk = names[:k]
             same = [n for n in topk if family_of(n) == fam]
             if same:
                 hit[k] += 1
-            denom = max(fam_counts[fam] - 1, 1)
             recall[k] += len(same) / denom
+            if k == 10:
+                bucket["hit10"] += 1 if same else 0
+                bucket["recall10"] += len(same) / denom
     dt = time.time() - t0
+    for b in per_scenario.values():
+        b["hit10"] /= b["n"]
+        b["recall10"] /= b["n"]
     n = len(files)
     return {
         "hit": {k: hit[k] / n for k in ks},
         "recall": {k: recall[k] / n for k in ks},
         "query_ms": 1000 * dt / n,
+        "scenarios": per_scenario,
     }
 
 
-def run_config(dataset_dir, backend, tta, embedder=None):
+def run_config(dataset_dir, backend, tta, embedder=None, tile_grid=0):
     cfg = cfg_mod.AppConfig()
     cfg.library_roots = [dataset_dir]
     cfg.backend = backend
     cfg.tta = tta
+    cfg.tile_grid = tile_grid
     cfg.save()
     engine = Engine(cfg)
     if embedder is not None:
@@ -78,10 +102,13 @@ def run_config(dataset_dir, backend, tta, embedder=None):
     engine.open()
     # temiz indeks
     IndexerService(engine).reindex()
+    # Desteklenen tüm formatlar ölçüme girer (kırpma senaryosu BMP'dir).
+    from desenarama.core import formats
+
     files = sorted(
         os.path.join(dataset_dir, f)
         for f in os.listdir(dataset_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        if f.lower().endswith(formats.SUPPORTED_EXTENSIONS)
     )
     res = evaluate(engine, files)
     res["n"] = len(files)
@@ -94,6 +121,9 @@ def main():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--out", default="bench.md")
     ap.add_argument("--skip-embedding", action="store_true")
+    ap.add_argument("--tiles", type=int, default=0, metavar="N",
+                    help="N×N karo indekslemeyi de ölç (ör. 3). İndeksleme "
+                         "süresini ~10× artırır ama kırpılmış sorguları çözer.")
     args = ap.parse_args()
 
     rows = []
@@ -118,6 +148,15 @@ def main():
             rows.append(("embedding", "kapalı", run_config(args.dataset, "embedding", False)))
             print("Embedding (TTA açık) ...")
             rows.append(("embedding", "açık", run_config(args.dataset, "embedding", True)))
+            if args.tiles:
+                print(f"Embedding + {args.tiles}×{args.tiles} karo ...")
+                rows.append((f"embedding+karo{args.tiles}", "açık",
+                             run_config(args.dataset, "embedding", True,
+                                        tile_grid=args.tiles)))
+                print(f"Hibrit + {args.tiles}×{args.tiles} karo ...")
+                rows.append((f"hibrit+karo{args.tiles}", "açık",
+                             run_config(args.dataset, "hybrid", True,
+                                        tile_grid=args.tiles)))
 
     # Markdown tablo
     lines = ["# Benchmark — Recall@k", "",
@@ -129,6 +168,19 @@ def main():
             f"| {backend} | {tta} | {r['hit'][1]:.2f} | {r['hit'][5]:.2f} | {r['hit'][10]:.2f} "
             f"| {r['recall'][5]:.2f} | {r['recall'][10]:.2f} | {r['query_ms']:.1f} |"
         )
+
+    # Senaryo kırılımı: toplam recall tek sayıya indiğinde "kırpılmış sorgular
+    # hiç çalışmıyor" gibi arızalar görünmez olur.
+    scenarios = sorted({s for _, _, r in rows for s in r["scenarios"]})
+    if scenarios:
+        lines += ["", "## Sorgu senaryosuna göre recall@10", "",
+                  "| Arka uç | TTA | " + " | ".join(scenarios) + " |",
+                  "|---" * (len(scenarios) + 2) + "|"]
+        for backend, tta, r in rows:
+            cells = [f"{r['scenarios'][s]['recall10']:.2f}" if s in r["scenarios"] else "—"
+                     for s in scenarios]
+            lines.append(f"| {backend} | {tta} | " + " | ".join(cells) + " |")
+
     out = "\n".join(lines) + "\n"
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(out)

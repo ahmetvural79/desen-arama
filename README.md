@@ -36,6 +36,13 @@ Ortak kalite hileleri her yöntemde geçerlidir:
   iki deseni bile ~0.88 kosinüsle eşler, bu yüzden skor koleksiyonun kendi
   medyanına göre yeniden ölçeklenir. Her sonuç ayrıca bir kalite bandıyla
   (Kopya / Çok benzer / Benzer / Zayıf) etiketlenir.
+- **Kısmi eşleşme (karo indeksleme):** sorgunuz desenin bir *parçasıysa* (motif
+  fotoğrafı, kısmi tarama), tek bir global gömme onu tüm halının taramasıyla
+  eşleştiremez. Ayarlar'dan açılan karo indekslemede her görsel tam kare + N×N
+  karo olarak gömülür ve sorguda karolar arası maksimum alınır. Varsayılan
+  kapalıdır: 3×3 indekslemeyi ~10× yavaşlatır. Sorgunun tamamına ek olarak
+  merkez kırpmasının da aranması (çok ölçekli sorgu) ise ücretsizdir ve
+  varsayılan olarak açıktır.
 - **Model şeffaflığı:** AI modeli yoksa uygulama sessizce zayıf bir yedeğe
   düşmez — durumu bildirir, indirmeyi (ilerleme + iptal) önerir ve
   reddedilirse hızlı moda döner. İndirilen dosya SHA256 ile doğrulanır.

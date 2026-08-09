@@ -104,7 +104,10 @@ class Engine:
                 batch.clear()
                 ids.clear()
 
-        for pos, (image_id, blob) in enumerate(self.store.iter_vectors()):
+        # Karo indekslemede aynı imaj birden çok FAISS satırına karşılık gelir;
+        # ``row_to_id`` her satırı sahibi imaja eşler, arama tarafı da imaj
+        # başına karolar arası maksimumu alır.
+        for pos, (image_id, _tile, blob) in enumerate(self.store.iter_vectors()):
             vec = np.frombuffer(blob, dtype=np.float32).copy()
             batch.append(vec)
             ids.append(image_id)
@@ -132,6 +135,15 @@ class Engine:
             self._load_vector_index()
 
     # -- embedder (tembel) -------------------------------------------------- #
+    def tiles_per_image(self) -> int:
+        """İmaj başına indekslenen vektör sayısı (tam kare + karolar).
+
+        Aday sayısını ölçeklemek için kullanılır: karo indekslemede top-k'yı tek
+        bir imajın karoları doldurabilir.
+        """
+        grid = self.config.tile_grid
+        return 1 + grid * grid if grid > 1 else 1
+
     def model_spec(self):
         return models.resolve(self.config.model_key)
 

@@ -164,8 +164,8 @@ geometri görüyor, karşılaştırmalar tutarsız.
 
 ## 4. Geliştirme planı
 
-> **Durum (9 Ağustos 2026):** Faz A, B ve C tamamlandı ve testlerle sabitlendi.
-> Faz D bekliyor.
+> **Durum (9 Ağustos 2026):** Faz A–D tamamlandı ve testlerle sabitlendi.
+> Kalan tek iş gerçek arşiv verisiyle doğrulama (D.5).
 
 ### Faz A — BMP ve format kapsaması ✅ TAMAMLANDI
 
@@ -258,7 +258,39 @@ doğrulamak Faz D.5'teki etiketli seti gerektirir.
    benzeri) ve renk histogramının **ayrı ayrı normalize edilip ağırlıklandırılması**
    — mevcut hâli bordür tarafından domine ediliyor.
 
-### Faz D — Kırpma/yakın çekim ve halıya özgü kalite (3–5 gün, orta-yüksek risk)
+### Faz D — Kırpma/yakın çekim ve halıya özgü kalite ✅ TAMAMLANDI
+
+Karo indekslemenin etkisi, aynı kütüphanede (124 görsel, DINOv2 ViT-S/14, temiz
+indeksler) ölçüldü — **tam olarak hedeflediği senaryoyu çözüyor, başka hiçbir
+şeyi bozmuyor**:
+
+| Sorgu senaryosu | Karo kapalı | Karo açık (3×3) |
+|---|---|---|
+| Döndürülmüş | 3/3 | 3/3 |
+| Farklı renk (colorway) | 3/3 | 3/3 |
+| **Kırpılmış / yakın çekim** | **1/3** | **3/3** |
+| Orijinal | 3/3 | 3/3 |
+
+Maliyeti gerçek: indeksleme 19.5 → 2.0 imaj/sn (10×), vektör satırı 124 → 1240.
+Bu yüzden varsayılan **kapalı**; Ayarlar'da maliyeti yazan üç seçenek sunuluyor
+(kapalı / 2×2 ≈ 5× / 3×3 ≈ 10×).
+
+Ölçüt seti (D.5) altyapısı da kuruldu: `tests/make_dataset.py` artık kırpılmış
+(BMP) senaryosu üretiyor, `tests/bench.py` **senaryo kırılımlı** recall@10
+raporluyor ve karo/hibrit yapılandırmalarını ölçüyor. Sonuçlar ve yorumu:
+[`bench-sonuclari.md`](bench-sonuclari.md). En çarpıcı bulgu: hash colorway
+varyantlarında DINOv2'den belirgin biçimde iyi (0.65 vs 0.25), karo destekli
+embedding ise kırpmada tek çalışan yöntem (0.40 vs 0.00). Bu, hibridin iki
+skorun **maksimumunu** alması gerektiğini gösterdi — ilk uygulama embedding
+skorunu üste yazıp hash'in üstünlüğünü kaybediyordu. Düzeltmeyle hibrit
+hit@10 0.85 → **0.98**, colorway recall 0.25 → **0.67**.
+
+Planda olmayan bir arıza daha bulundu: **embedding'lerin hangi koşullarda
+üretildiği kayıtlı değildi.** Faz C'deki letterbox değişikliği eski indeksleri
+geçersiz kılıyor, ama uygulama bunu bilmiyor ve eski vektörlerle yeni sorguları
+karşılaştırmaya devam ediyordu. Artık model, ön işleme sürümü ve karo ızgarası
+bir imzada saklanıyor; imza değişince embedding'ler otomatik yeniden
+hesaplanıyor (metadata korunur, pahalı tarama tekrarlanmaz).
 
 1. **Karo (tile) indeksleme.** Her görsel için tam kare + 3×3 kafes = 10 gömme
    üret, `vectors` tablosuna `(image_id, tile_no, vec)` olarak sakla. Sorguda

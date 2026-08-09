@@ -64,6 +64,48 @@ def preprocess(rgb: np.ndarray, size: int = 224) -> np.ndarray:
     return np.ascontiguousarray(chw[None, :, :, :], dtype=np.float32)
 
 
+#: Ön işleme sürümü. Ön işleme değiştiğinde artırılır; :func:`signature` bunu
+#: taşır ve eski (uyumsuz geometriyle üretilmiş) embedding'ler geçersiz kılınır.
+#: 1 = merkez kırpma (v1.0), 2 = letterbox.
+PREPROCESS_VERSION = 2
+
+
+def tiles(rgb: np.ndarray, grid: int) -> list[np.ndarray]:
+    """Tam kare + ``grid × grid`` karo listesi döndürür.
+
+    Halı arşivinde sorgu sıklıkla desenin **bir parçasıdır** (motifin fotoğrafı,
+    kısmi tarama); kütüphanedeki karşılığı ise tüm halının taramasıdır. Tek bir
+    global gömme bu ikisini eşleştiremez: ölçümde kırpılmış sorgu, alakasız
+    desenlerin altına düşüyordu. Karolar indekslenip sorguda **karolar arası
+    maksimum** benzerlik alınınca kısmi eşleşme mümkün olur.
+
+    ``grid <= 1`` ise yalnızca tam kare döner (karo indeksleme kapalı).
+    Karolar bitişiktir (örtüşmez); örtüşme maliyeti ikiye katlar ve ölçülmüş
+    bir kazanç göstermeden eklenmemiştir.
+    """
+    out = [rgb]
+    if grid <= 1:
+        return out
+    h, w = rgb.shape[0], rgb.shape[1]
+    for ty in range(grid):
+        for tx in range(grid):
+            y0, y1 = h * ty // grid, h * (ty + 1) // grid
+            x0, x1 = w * tx // grid, w * (tx + 1) // grid
+            if y1 > y0 and x1 > x0:
+                out.append(np.ascontiguousarray(rgb[y0:y1, x0:x1]))
+    return out
+
+
+def signature(embedder_name: str, model_key: str, dim: int, tile_grid: int) -> str:
+    """İndekslenmiş vektörlerin **hangi koşullarda** üretildiğini tanımlar.
+
+    Model, ön işleme sürümü veya karo ızgarası değişirse eski vektörler yeni
+    sorgularla karşılaştırılamaz hâle gelir. v1.0'da böyle bir kontrol yoktu;
+    ön işleme değiştiğinde eski indeks sessizce yanlış sonuç üretirdi.
+    """
+    return f"{embedder_name}|{model_key}|dim{dim}|prep{PREPROCESS_VERSION}|grid{tile_grid}"
+
+
 class Embedder(ABC):
     dim: int
     name: str

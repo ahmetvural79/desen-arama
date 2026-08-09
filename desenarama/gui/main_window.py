@@ -130,7 +130,12 @@ class MainWindow(QMainWindow):
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("Hızlı (hash) — aynı/benzer şekil", cfg_mod.BACKEND_HASH)
         self.backend_combo.addItem("AI (DINOv2) — derin benzerlik", cfg_mod.BACKEND_EMBEDDING)
-        self.backend_combo.addItem("Hibrit — hash + AI yeniden sıralama", cfg_mod.BACKEND_HYBRID)
+        # Ölçümde hibrit, saf embedding'i her senaryoda geçti (hit@10 0.98 vs
+        # 0.85) ve sorgu süresi aynı kaldı: hash colorway varyantlarında,
+        # embedding kırpılmış/kısmi sorgularda güçlü; hibrit ikisinin en iyisini
+        # alıyor. Model kuruluysa önerilen seçenek budur.
+        self.backend_combo.addItem(
+            "Hibrit — hash + AI birlikte (önerilen)", cfg_mod.BACKEND_HYBRID)
         self.backend_combo.setCurrentIndex(
             [cfg_mod.BACKEND_HASH, cfg_mod.BACKEND_EMBEDDING, cfg_mod.BACKEND_HYBRID].index(self.config.backend)
         )
